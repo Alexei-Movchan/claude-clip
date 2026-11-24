@@ -176,6 +176,28 @@ def _ffmpeg_filter_path(path: str) -> str:
 
 # --------------------------------------------------------------------------- speech recognition
 
+# Phrases Whisper tends to invent on music / silence (learned from subtitle files of its training data).
+_HALLUCINATIONS = ('продолжение следует', 'субтитры', 'редактор субтитров', 'корректор', 'спасибо за просмотр',
+                   'подписывайтесь', 'ставьте лайк', 'до новых встреч', 'динамичная музыка', 'спокойная музыка',
+                   'музыка', 'аплодисменты', 'смех', 'dimatorzok', 'amara.org')
+
+
+def is_hallucination(text: str, no_speech_prob: float = 0.0, avg_logprob: float = 0.0,
+                     compression_ratio: float = 1.0, word_probs: list[float] | None = None) -> bool:
+    """True for a Whisper segment that is most likely invented over music, noise or silence."""
+    t = re.sub(r'[^\w\s]', ' ', (text or '').lower().replace('ё', 'е')).strip()
+    if not t: return True
+    if no_speech_prob > 0.6 and avg_logprob < -0.6: return True     # the model itself thinks there is no speech
+    if compression_ratio > 2.4: return True                          # the same words repeated over and over
+    if word_probs:
+        mean_p = sum(word_probs) / len(word_probs)
+        if mean_p < 0.45 or (len(word_probs) <= 3 and mean_p < 0.6): return True   # words "guessed" from noise
+    short = len(t.split()) <= 4
+    if short and any(h in t for h in _HALLUCINATIONS): return True
+    if '♪' in (text or '') or re.fullmatch(r'[\s.…!?-]*', text or ''): return True
+    return False
+
+
 def transcribe(path: str, model_size: str = 'small', device: str = 'auto', progress_callback=None,
                notice_callback: Callable[[str], None] | None = None) -> tuple[list[dict], str]:
     from .gpu import add_nvidia_dll_dirs, gpu_libs_installed, cuda_device_count
@@ -203,17 +225,26 @@ def transcribe(path: str, model_size: str = 'small', device: str = 'auto', progr
         except (ImportError, TypeError):
             segments, info = model.transcribe(path, **kwargs)
         words, full = [], []
+        dropped = 0
         total_duration = max(0.1, float(getattr(info, 'duration', 0) or 0))
         # The generator is lazy: CUDA library errors surface here, not at model creation.
         for seg in segments:
-            full.append(seg.text.strip())
             if progress_callback:
                 progress_callback(min(100, int(float(seg.end) / total_duration * 100)))
+            probs = [float(getattr(w, 'probability', 1.0) or 0.0) for w in (seg.words or [])]
+            if is_hallucination(seg.text, float(getattr(seg, 'no_speech_prob', 0.0) or 0.0),
+                                float(getattr(seg, 'avg_logprob', 0.0) or 0.0),
+                                float(getattr(seg, 'compression_ratio', 1.0) or 1.0), probs):
+                dropped += 1
+                continue   # music / noise: becomes a pause, so it gets cut from the clip
+            full.append(seg.text.strip())
             if seg.words:
                 for w in seg.words:
                     words.append({'start': float(w.start), 'end': float(w.end), 'word': w.word})
             else:
                 words.append({'start': float(seg.start), 'end': float(seg.end), 'word': seg.text})
+        if dropped and notice_callback:
+            notice_callback(f'Отброшено выдуманных фраз на музыке/шуме: {dropped}')
         words.sort(key=lambda w: w['start'])  # batched mode may yield chunks slightly out of order
         return words, ' '.join(full)
 

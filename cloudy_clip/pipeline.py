@@ -77,12 +77,15 @@ class AnalyzeWorker(QObject):
     def _cached_transcript(self, model: str):
         """Re-running the same video skips Whisper (the slowest step)."""
         st = os.stat(self.source)
-        key = {'source': os.path.abspath(self.source), 'size': st.st_size, 'mtime': int(st.st_mtime), 'model': model}
+        # 'filter' changes when speech filtering changes: an old transcript is redone once (unless edited by hand).
+        key = {'source': os.path.abspath(self.source), 'size': st.st_size, 'mtime': int(st.st_mtime), 'model': model, 'filter': 2}
         cache = data_dir_for(self.out_dir) / 'transcript_cache.json'
         if cache.exists():
             try:
                 data = json.loads(cache.read_text(encoding='utf-8'))
-                if data.get('key') == key and data.get('words'):
+                old = dict(data.get('key') or {}); old.pop('filter', None)
+                same_video = old == {k: v for k, v in key.items() if k != 'filter'}
+                if data.get('words') and (data.get('key') == key or (same_video and data.get('edited'))):
                     return key, data['words'], data.get('transcript', '')
             except Exception:
                 pass
