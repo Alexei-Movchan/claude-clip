@@ -80,7 +80,7 @@ def escape_ass(text: str) -> str:
 # Colours are RGB hex as people know them; ASS wants &H00BBGGRR.
 SUB_PRESETS: dict[str, dict] = {
     'Классика': {'font': 'Arial', 'size': 64, 'primary': 'FFFFFF', 'active': 'FFD700', 'outline': 4, 'shadow': 2,
-                 'position': 'Низ', 'upper': False, 'max_words': 5},
+                 'position': 'Низ', 'upper': False, 'max_words': 5, 'no_punct': True},
     'Крупно': {'font': 'Arial Black', 'size': 82, 'primary': 'FFFFFF', 'active': 'FFD700', 'outline': 6, 'shadow': 0,
                'position': 'Нижняя треть', 'upper': True, 'max_words': 3},
     'Неон': {'font': 'Arial', 'size': 68, 'primary': 'FFFFFF', 'active': '39FF14', 'outline': 5, 'shadow': 3,
@@ -119,6 +119,15 @@ def _chunks(words: list[dict], max_words: int, max_gap: float = 0.35) -> list[li
     return chunks
 
 
+_PUNCT = re.compile(r'[.,;:!…"«»„“”()\[\]]')
+
+
+def strip_punct(token: str) -> str:
+    """Drop punctuation except '?' and hyphens inside words (кто-то, по-моему)."""
+    t = _PUNCT.sub('', token)
+    return re.sub(r'^[-–—]+|[-–—]+$', '', t).strip()
+
+
 def write_ass(path: str, words: list[dict], total: float, style: dict | None = None) -> None:
     """Captions on the FINAL timeline. The word being spoken right now is highlighted.
 
@@ -138,17 +147,22 @@ def write_ass(path: str, words: list[dict], total: float, style: dict | None = N
     selected = sorted((w for w in words if w['end'] > 0 and w['start'] < total), key=lambda w: w['start'])
     chunks = _chunks(selected, int(st.get('max_words') or 5))
     lines = [header]
+    no_punct = st.get('no_punct', True)
     for ci, chunk in enumerate(chunks):
         tokens = []
+        kept = []
         for w in chunk:
             t = w.get('word', '').strip()
-            tokens.append(escape_ass(t.upper() if st.get('upper') else t))
+            if no_punct: t = strip_punct(t)
+            if not t: continue               # a lone dash or dots: nothing to show
+            kept.append(w); tokens.append(escape_ass(t.upper() if st.get('upper') else t))
+        if not kept: continue
         chunk_end = min(total, float(chunk[-1]['end']) + 0.15)
         if ci + 1 < len(chunks):
             chunk_end = min(chunk_end, float(chunks[ci + 1][0]['start']))
-        for i, w in enumerate(chunk):
+        for i, w in enumerate(kept):
             a = max(0.0, float(w['start']))
-            b = float(chunk[i + 1]['start']) if i + 1 < len(chunk) else chunk_end
+            b = float(kept[i + 1]['start']) if i + 1 < len(kept) else chunk_end
             if b - a < 0.01: continue
             text = ' '.join(('{\\c' + active + '&}' + t + '{\\c' + primary + '&}') if j == i else t
                             for j, t in enumerate(tokens))
@@ -156,7 +170,7 @@ def write_ass(path: str, words: list[dict], total: float, style: dict | None = N
     Path(path).write_text(''.join(lines), encoding='utf-8-sig')
 
 
-def write_srt(path: str, words: list[dict], total: float) -> None:
+def write_srt(path: str, words: list[dict], total: float, no_punct: bool = False) -> None:
     """Plain subtitles for uploading to TikTok/YouTube (same timeline as the video)."""
     def ts(t: float) -> str:
         ms = max(0, int(round(t * 1000)))
@@ -166,7 +180,7 @@ def write_srt(path: str, words: list[dict], total: float) -> None:
     out = []
     for n, chunk in enumerate(_chunks(selected, 7, 0.6), 1):
         out.append(f"{n}\n{ts(chunk[0]['start'])} --> {ts(min(total, chunk[-1]['end'] + 0.1))}\n"
-                   f"{' '.join(w['word'].strip() for w in chunk)}\n")
+                   f"{' '.join(t for t in ((strip_punct(w['word']) if no_punct else w['word'].strip()) for w in chunk) if t)}\n")
     Path(path).write_text('\n'.join(out), encoding='utf-8')
 
 
@@ -1031,7 +1045,8 @@ def render_clip(source: str, banner: str, clip: dict, words: list[dict], output:
         ass = os.path.join(td, 'captions.ass')
         write_ass(ass, final_words, total, opt['subtitle_style'])
         if opt['srt']:
-            write_srt(str(Path(output).with_suffix('.srt')), final_words, total)
+            write_srt(str(Path(output).with_suffix('.srt')), final_words, total,
+                      no_punct=subtitle_style(opt['subtitle_style']).get('no_punct', True))
         check = _assemble(base, banner, banner_info, output, base_dur, positions, ad_dur, speed, ass, td, hook_range,
                           progress=lambda f: report(0.6 + 0.4 * f))
         out_positions = [round(to_final(p) - ad_dur, 2) for p in positions]

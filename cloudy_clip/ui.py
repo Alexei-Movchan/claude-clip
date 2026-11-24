@@ -575,6 +575,7 @@ class MainWindow(QMainWindow):
         self.sub_pos = QComboBox(); self.sub_pos.addItems(list(SUB_POSITIONS)); sf.addRow('Положение', self.sub_pos)
         self.sub_color = QComboBox(); self.sub_color.addItems(list(ACTIVE_COLORS)); sf.addRow('Цвет текущего слова', self.sub_color)
         self.sub_upper = Switch('ЗАГЛАВНЫМИ БУКВАМИ'); sf.addRow(self.sub_upper)
+        self.sub_nopunct = Switch('Без знаков препинания (вопросительный знак остаётся)'); self.sub_nopunct.setChecked(True); sf.addRow(self.sub_nopunct)
         self.srt = Switch('Сохранять субтитры отдельным файлом .srt (для загрузки на площадку)'); self.srt.setChecked(True); sf.addRow(self.srt)
         self.save_txt = Switch('Сохранять описание ролика отдельным файлом .txt рядом с роликом'); self.save_txt.setChecked(False); sf.addRow(self.save_txt)
         lay.addWidget(subs); lay.addStretch()
@@ -587,7 +588,7 @@ class MainWindow(QMainWindow):
         h.addWidget(side_area)
         for sig in (self.background.currentIndexChanged, self.zoom.currentIndexChanged, self.sub_preset.currentIndexChanged,
                     self.sub_font.currentFontChanged, self.sub_size.valueChanged, self.sub_pos.currentIndexChanged,
-                    self.sub_color.currentIndexChanged, self.sub_upper.toggled, self.speaker_crop.toggled,
+                    self.sub_color.currentIndexChanged, self.sub_upper.toggled, self.sub_nopunct.toggled, self.speaker_crop.toggled,
                     self.soft_follow.toggled):
             sig.connect(lambda *_: self.design_preview.request())
         self.tabs.addTab(page, 'Оформление')
@@ -687,7 +688,8 @@ class MainWindow(QMainWindow):
 
     def subtitle_style(self) -> dict:
         return {'preset': self.sub_preset.currentText(), 'font': self.sub_font.currentFont().family(), 'size': self.sub_size.value(),
-                'position': self.sub_pos.currentText(), 'active': ACTIVE_COLORS[self.sub_color.currentText()], 'upper': self.sub_upper.isChecked()}
+                'position': self.sub_pos.currentText(), 'active': ACTIVE_COLORS[self.sub_color.currentText()], 'upper': self.sub_upper.isChecked(),
+                'no_punct': self.sub_nopunct.isChecked()}
 
     def sync_preview_speaker(self, on: bool, origin):
         for pane in (getattr(self, 'design_preview', None), getattr(self, 'select_preview', None)):
@@ -758,6 +760,7 @@ class MainWindow(QMainWindow):
         color = next((k for k, v in ACTIVE_COLORS.items() if v == st.get('active')), None)
         if color: self.sub_color.setCurrentText(color)
         if 'upper' in st: self.sub_upper.setChecked(bool(st['upper']))
+        if 'no_punct' in st: self.sub_nopunct.setChecked(bool(st['no_punct']))
         if ui.get('out_dir'): self.out_edit.setText(ui['out_dir'])
         if ui.get('banner') and Path(ui['banner']).exists():
             self.banner = ui['banner']; self.banner_edit.setText(self.banner)
