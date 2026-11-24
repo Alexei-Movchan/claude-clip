@@ -235,7 +235,10 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget(); outer.addWidget(self.tabs, 1)
         self._build_project_tab(); self._build_design_tab(); self._build_select_tab(); self._build_results_tab(); self._build_settings_tab()
         outer.addWidget(self._build_bottom_bar())
+        self._loading = True
         self.load_settings()
+        self._loading = False
+        self._wire_autosave()
         self.tray = QSystemTrayIcon(self.windowIcon(), self) if QSystemTrayIcon.isSystemTrayAvailable() else None
         self._t_start = None; self._eta = -1.0; self._eta_at = 0.0
         self.clock = QTimer(self); self.clock.timeout.connect(self._tick); self.clock.start(1000)
@@ -381,7 +384,7 @@ class MainWindow(QMainWindow):
         self.ollama_url = QLineEdit('http://127.0.0.1:11434'); form.addRow('Адрес локального Ollama', self.ollama_url)
         lay.addWidget(box)
         info = QLabel('Рекомендация для RTX 4060 Laptop с 8 ГБ VRAM: qwen3:4b. Если Ollama недоступен, приложение переключается на встроенный офлайн-подбор, а описания делаются по шаблону.'); info.setWordWrap(True); info.setObjectName('muted'); lay.addWidget(info)
-        save = QPushButton('Сохранить настройки'); save.clicked.connect(lambda: self.save_settings(notify=True)); lay.addWidget(save)
+        saved = QLabel('Все настройки программы сохраняются автоматически при каждом изменении.'); saved.setObjectName('muted'); lay.addWidget(saved)
         updates = QGroupBox('Обновления'); uf = QFormLayout(updates)
         self.auto_update_box = QCheckBox('Проверять обновления при запуске'); self.auto_update_box.setChecked(True); uf.addRow(self.auto_update_box)
         update_btn = QPushButton('Проверить обновления сейчас'); update_btn.clicked.connect(lambda: self.check_for_updates(manual=True)); uf.addRow(update_btn)
@@ -476,11 +479,35 @@ class MainWindow(QMainWindow):
         if color: self.sub_color.setCurrentText(color)
         if 'upper' in st: self.sub_upper.setChecked(bool(st['upper']))
         if ui.get('out_dir'): self.out_edit.setText(ui['out_dir'])
+        if ui.get('banner') and Path(ui['banner']).exists():
+            self.banner = ui['banner']; self.banner_edit.setText(self.banner)
         if 'preview_speaker' in ui:
             for pane in (self.design_preview, self.select_preview):
                 pane.speaker.blockSignals(True); pane.speaker.setChecked(bool(ui['preview_speaker'])); pane.speaker.blockSignals(False)
 
-    def save_settings(self, notify: bool = False):
+    def _wire_autosave(self):
+        """Save ~0.6 s after any setting changes, so nothing is lost if the app is closed or crashes."""
+        self._autosave = QTimer(self); self._autosave.setSingleShot(True)
+        self._autosave.timeout.connect(lambda: self.save_settings(quiet=True))
+        kick = lambda *_: None if self._loading else self._autosave.start(600)
+        skip = {self.banner_edit}
+        for w in self.findChildren(QFontComboBox): w.currentFontChanged.connect(kick)
+        for w in self.findChildren(QComboBox):
+            if not isinstance(w, QFontComboBox):
+                w.currentIndexChanged.connect(kick)
+                if w.isEditable(): w.currentTextChanged.connect(kick)
+        for w in self.findChildren(QCheckBox): w.toggled.connect(kick)
+        for w in self.findChildren(QSpinBox): w.valueChanged.connect(kick)
+        for w in self.findChildren(QLineEdit):
+            if w not in skip and not w.isReadOnly() and not isinstance(w.parent(), (QComboBox, QSpinBox)):
+                w.textChanged.connect(kick)
+
+    def closeEvent(self, event):
+        try: self.save_settings(quiet=True)
+        except Exception: pass
+        super().closeEvent(event)
+
+    def save_settings(self, notify: bool = False, quiet: bool = False):
         d = {'use_local_ai': True, 'local_model': self.local_model.currentText().strip(), 'ollama_url': self.ollama_url.text().strip(),
              'github_owner': self.github_owner.text().strip(), 'github_repo': self.github_repo.text().strip(),
              'auto_update': self.auto_update_box.isChecked(), 'skip_version': self.skip_version,
@@ -490,8 +517,10 @@ class MainWindow(QMainWindow):
                     'manual_pick': self.manual_pick.isChecked(), 'ai_desc': self.ai_desc.isChecked(), 'hook': self.hook.isChecked(),
                     'punch': self.punch.isChecked(), 'srt': self.srt.isChecked(), 'subtitles': self.subtitle_style(),
                     'speaker_crop': self.speaker_crop.isChecked(), 'preview_speaker': self.design_preview.speaker.isChecked(),
-                    'out_dir': self.out_edit.text().strip()}}
-        (Path.home() / '.cloudy_clip_studio.json').write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8')
+                    'out_dir': self.out_edit.text().strip(), 'banner': self.banner}}
+        # Write to a temp file and swap: a crash mid-write can never leave a broken settings file.
+        target = Path.home() / '.cloudy_clip_studio.json'; tmp = target.with_suffix('.json.tmp')
+        tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8'); os.replace(tmp, target)
         if notify: QMessageBox.information(self, 'Настройки', 'Сохранено. Облачные AI API отключены.')
 
     def check_for_updates(self, manual: bool = True):
@@ -610,7 +639,7 @@ class MainWindow(QMainWindow):
 
     def pick_banner(self):
         p, _ = QFileDialog.getOpenFileName(self, 'Выберите анимационный баннер', '', 'Видео/GIF (*.mp4 *.mov *.webm *.gif *.mkv)')
-        if p: self.banner = p; self.banner_edit.setText(p)
+        if p: self.banner = p; self.banner_edit.setText(p); self.save_settings(quiet=True)
 
     def pick_output(self):
         p = QFileDialog.getExistingDirectory(self, 'Папка для результатов', self.out_edit.text())
