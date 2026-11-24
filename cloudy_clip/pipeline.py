@@ -97,7 +97,8 @@ class AnalyzeWorker(QObject):
             clips = ai_select(words, transcript, base_url=self.settings.get('ollama_url', 'http://127.0.0.1:11434'),
                               model=self.settings.get('local_model', 'qwen3:4b'), target_min=90, target_max=target_max,
                               use_local_ai=True, notice_callback=lambda msg: self.progress.emit(40, msg),
-                              cancel=lambda: self._cancel)
+                              cancel=lambda: self._cancel, fill=self.settings.get('fill_clips', True),
+                              debug_dir=self.out_dir)
             if not clips: raise RuntimeError('Не удалось найти фрагменты нужной продолжительности. Попробуйте более длинное видео.')
             # Trim long silent openings/endings when enough speech remains.
             speech_clips = []

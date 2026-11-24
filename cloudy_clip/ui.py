@@ -306,6 +306,8 @@ class MainWindow(QMainWindow):
         self.device = QComboBox(); self.device.addItems(['auto', 'cuda', 'cpu']); of.addRow('Устройство распознавания', self.device)
         self.gpu_label = QLabel(self._gpu_status()); self.gpu_label.setWordWrap(True); self.gpu_label.setObjectName('muted'); of.addRow(self.gpu_label)
         self.encoder = QComboBox(); self.encoder.addItems(['Авто — видеокарта NVIDIA, если есть', 'Только процессор']); of.addRow('Кодирование видео', self.encoder)
+        self.fill_clips = QComboBox(); self.fill_clips.addItems(['Как можно больше — нейросеть + добор из остального видео', 'Только лучшие — что выбрала нейросеть'])
+        of.addRow('Количество роликов', self.fill_clips)
         self.manual_pick = QCheckBox('Показать найденные моменты и выбрать вручную перед монтажом'); self.manual_pick.setChecked(True); of.addRow(self.manual_pick)
         self.ai_desc = QCheckBox('Название, описание и хэштеги через локальный AI'); self.ai_desc.setChecked(True); of.addRow(self.ai_desc)
         lay.addWidget(opts)
@@ -454,6 +456,7 @@ class MainWindow(QMainWindow):
                 'background': 'black' if self.background.currentIndex() == 1 else 'blur',
                 'hook': self.hook.isChecked(), 'punch_ins': self.punch.isChecked(), 'srt': self.srt.isChecked(),
                 'speaker_crop': self.speaker_crop.isChecked(), 'soft_follow': self.soft_follow.isChecked(),
+                'fill_clips': self.fill_clips.currentIndex() == 0,
                 'ai_descriptions': self.ai_desc.isChecked(), 'manual_pick': self.manual_pick.isChecked(),
                 'subtitle_style': self.subtitle_style()}
 
@@ -472,7 +475,7 @@ class MainWindow(QMainWindow):
         ui = d.get('ui', {})
         for key, widget in (('whisper', self.whisper), ('device', self.device), ('zoom', self.zoom)):
             if ui.get(key): widget.setCurrentText(ui[key])
-        for key, widget in (('encoder', self.encoder), ('background', self.background)):
+        for key, widget in (('encoder', self.encoder), ('background', self.background), ('fill_clips', self.fill_clips)):
             if isinstance(ui.get(key), int): widget.setCurrentIndex(ui[key])
         for key, widget in (('manual_pick', self.manual_pick), ('ai_desc', self.ai_desc), ('hook', self.hook),
                             ('punch', self.punch), ('srt', self.srt), ('speaker_crop', self.speaker_crop),
@@ -522,6 +525,7 @@ class MainWindow(QMainWindow):
              'shortcut_offered': self.shortcut_offered,
              'ui': {'whisper': self.whisper.currentText(), 'device': self.device.currentText(), 'zoom': self.zoom.currentText(),
                     'encoder': self.encoder.currentIndex(), 'background': self.background.currentIndex(),
+                    'fill_clips': self.fill_clips.currentIndex(),
                     'manual_pick': self.manual_pick.isChecked(), 'ai_desc': self.ai_desc.isChecked(), 'hook': self.hook.isChecked(),
                     'punch': self.punch.isChecked(), 'srt': self.srt.isChecked(), 'subtitles': self.subtitle_style(),
                     'speaker_crop': self.speaker_crop.isChecked(), 'soft_follow': self.soft_follow.isChecked(),

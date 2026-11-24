@@ -296,28 +296,44 @@ def _dedupe(clips: list[dict], max_overlap: float) -> list[dict]:
     return sorted(result, key=lambda x: x['start'])
 
 
-def fallback_clips(words: list[dict], target_min: float = 90, target_max: float = 150) -> list[dict]:
-    """Offline selection: windows that start and end on phrase borders, scored by text signals."""
+def fallback_clips(words: list[dict], target_min: float = 90, target_max: float = 150,
+                   taken: list[tuple[float, float]] | None = None) -> list[dict]:
+    """Offline selection packed as tightly as possible.
+
+    Candidate windows start and end on phrase borders; then weighted interval scheduling picks
+    the largest number of non-overlapping windows (text score breaks ties). `taken` = time
+    ranges already used by AI-picked clips, which candidates must not overlap.
+    """
+    import bisect
     sents = build_sentences(words)
     if not sents: return []
-    goal = (target_min + target_max) / 2
-    candidates, last_start = [], -1e9
+    taken = taken or []
+    goals = sorted({target_min + 8, (target_min + target_max) / 2})
+    candidates, seen = [], set()
     for i, s in enumerate(sents):
-        if s['start'] - last_start < 15: continue
         natural = i == 0 or s['start'] - sents[i - 1]['end'] > 0.6 or sents[i - 1]['text'].endswith(_SENT_END)
         if not natural: continue
-        j = i
-        while j + 1 < len(sents) and sents[j + 1]['end'] - s['start'] <= goal: j += 1
-        fit = fit_to_sentences(sents, i, j, target_min, target_max)
-        if not fit: continue
-        a, b = fit
-        text = ' '.join(x['text'] for x in sents[a:b + 1])
-        score = _candidate_score(text) + (5 if sents[b]['text'].endswith(_SENT_END) else 0)
-        candidates.append({'start': sents[a]['start'], 'end': sents[b]['end'], 'title': '', 'hook': '',
-                           'score': round(min(100, score), 1),
-                           'reason': 'Автоматический подбор по фразам, паузам и текстовым сигналам', 'transcript': text})
-        last_start = s['start']
-    result = _dedupe(candidates, 0.2)
+        for goal in goals:
+            j = i
+            while j + 1 < len(sents) and sents[j + 1]['end'] - s['start'] <= goal: j += 1
+            fit = fit_to_sentences(sents, i, j, target_min, target_max)
+            if not fit or fit in seen: continue
+            seen.add(fit); a, b = fit
+            st, en = sents[a]['start'], sents[b]['end']
+            if any(min(en, y) - max(st, x) > 0.5 for x, y in taken): continue
+            text = ' '.join(x['text'] for x in sents[a:b + 1])
+            score = _candidate_score(text) + (5 if sents[b]['text'].endswith(_SENT_END) else 0)
+            candidates.append({'start': st, 'end': en, 'title': '', 'hook': '', 'score': round(min(100, score), 1),
+                               'reason': 'Автоматический подбор по фразам, паузам и текстовым сигналам', 'transcript': text})
+    if not candidates: return []
+    candidates.sort(key=lambda c: c['end'])
+    ends = [c['end'] for c in candidates]
+    best = [(0.0, [])]  # best[k] = (weight, chosen indices) using the first k candidates
+    for k, c in enumerate(candidates):
+        p = bisect.bisect_right(ends, c['start'] + 0.05, 0, k)   # candidates that end before this one starts
+        take = (best[p][0] + 1000 + c['score'], best[p][1] + [k])  # count first, then text score
+        best.append(take if take[0] > best[k][0] else best[k])
+    result = [candidates[k] for k in best[-1][1]]
     for n, c in enumerate(result, 1): c['title'] = f'Нарезка {n}'
     return result
 
@@ -435,7 +451,8 @@ def _sentence_chunks(sents: list[dict], max_tokens: int, overlap_seconds: float)
 def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: str = 'http://127.0.0.1:11434', model: str = 'qwen3:4b',
               target_min: int = 90, target_max: int = 150, use_local_ai: bool = True,
               notice_callback: Callable[[str], None] | None = None,
-              cancel: Callable[[], bool] | None = None) -> list[dict]:
+              cancel: Callable[[], bool] | None = None, fill: bool = True,
+              debug_dir: str | None = None) -> list[dict]:
     """Local-first highlight selection; deterministic offline fallback if Ollama is unavailable.
 
     The model sees numbered phrases and answers with phrase numbers, not seconds,
@@ -452,18 +469,21 @@ def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: s
         lines = '\n'.join(f"{s['id']}. [{s['start']:.1f}-{s['end']:.1f}] {s['text']}" for s in chunk)
         prompt = (
             'Ниже расшифровка видео, разбитая на пронумерованные фразы с таймкодами в секундах.\n'
-            f'Выбери до 6 лучших самостоятельных фрагментов для TikTok/Shorts. Каждый фрагмент — непрерывный диапазон фраз '
+            f'Выбери как можно больше (до 8) хороших самостоятельных фрагментов для TikTok/Shorts. Каждый фрагмент — непрерывный диапазон фраз '
             f'от start_id до end_id длительностью от {target_min} до {target_max} секунд (считай по таймкодам).\n'
             'Фрагмент должен начинаться с начала мысли и заканчиваться законченной мыслью, быть понятным без остального видео.\n'
             'Ищи законченные истории, юмор, эмоции, неожиданные повороты, сильные мысли и интригу. Фрагменты не должны пересекаться.\n'
             'Верни JSON: {"clips": [{"start_id": 0, "end_id": 0, "title": "короткое название", '
             '"hook": "дословная цепляющая фраза из фрагмента", "score": 1-100, "reason": "почему это интересно"}]}\n'
-            'Пиши компактно, без отступов и переносов строк: title — до 8 слов, hook — до 12 слов, reason — до 15 слов.\n\n'
+            'Пиши компактно, без отступов и переносов строк: title — до 8 слов, hook — до 12 слов, reason — до 10 слов.\n\n'
             'Фразы:\n' + lines)
         try:
             tokens_note = (lambda k, n=n: notice_callback(f'Локальный AI: часть {n}/{len(chunks)} · ответ модели: {k} токенов')) \
                 if notice_callback else None
             raw = _strip_model_output(_ollama_chat(base_url, model, prompt, max_tokens=4000, on_tokens=tokens_note, cancel=cancel))
+            if debug_dir:  # keep the raw answer: if the model misbehaves we can see what it wrote
+                try: Path(debug_dir, f'ai_answer_part{n}.txt').write_text(raw, encoding='utf-8')
+                except OSError: pass
             try:
                 items = _extract_clip_list(json.loads(raw))
             except ValueError:
@@ -494,6 +514,11 @@ def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: s
                           'transcript': ' '.join(x['text'] for x in sents[a:b + 1])})
     unique = _dedupe(valid, 0.3)
     if unique:
+        if fill:  # "as many as possible": add non-overlapping offline windows from the rest of the video
+            extra = fallback_clips(words, target_min, target_max, taken=[(c['start'], c['end']) for c in unique])
+            for c in extra:
+                c['reason'] = 'Добор: ' + c['reason'][0].lower() + c['reason'][1:]; c['title'] = ''
+            unique = sorted(unique + extra, key=lambda c: c['start'])
         return unique
     clips = fallback_clips(words, target_min, target_max)
     why = '; '.join(errors) if errors else 'модель не вернула подходящих фрагментов'
