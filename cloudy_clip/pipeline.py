@@ -171,7 +171,7 @@ class RenderWorker(QObject):
                                                           progress=lambda f: step(0.03 + 0.2 * f))
                 except Exception as speaker_error:
                     speaker_data = {'keyframes': [], 'enabled': False, 'reason': f'Резервное кадрирование: {str(speaker_error)[:120]}'}
-                step(0.23, f'Монтаж {i}/{n}: {title}')
+                step(0.23, f"Монтаж {i}/{n}: {clip.get('title') or title}")
                 banner_data = render_clip(self.source, self.banner, clip, words, str(out), 1.0, speaker_data=speaker_data,
                                           zoom=float(self.settings.get('zoom', 1.3)),
                                           options={**options, 'progress': lambda f: step(0.23 + 0.72 * f)})

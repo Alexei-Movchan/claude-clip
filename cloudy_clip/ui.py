@@ -24,7 +24,7 @@ QGroupBox::title {subcontrol-origin:margin;left:12px;padding:0 5px;color:#a9b8ce
 QLineEdit,QComboBox,QTextEdit,QListWidget,QSpinBox,QFontComboBox {background:#171d29;border:1px solid #303b50;border-radius:8px;padding:7px;color:#f4f6fb;}
 QPushButton {background:#27344a;border:0;border-radius:9px;padding:10px 16px;color:white;font-weight:600;}
 QPushButton:hover {background:#344766;} QPushButton#primary {background:#6b55e8;} QPushButton#primary:hover {background:#806df2;}
-QPushButton:disabled {background:#1c2433;color:#6c7789;}
+QPushButton:disabled, QPushButton#primary:disabled {background:#1c2433;color:#8a95a8;}
 QProgressBar {background:#1b2331;border:0;border-radius:7px;height:16px;text-align:center;color:white;}
 QProgressBar::chunk {background:#6b55e8;border-radius:7px;}
 QTabWidget::pane {border:1px solid #293244;border-radius:10px;} QTabBar::tab {background:#171d29;padding:10px 18px;border-radius:7px;margin:3px;} QTabBar::tab:selected {background:#394867;}
