@@ -2,13 +2,13 @@ from __future__ import annotations
 import json, os, sys, time
 from pathlib import Path
 from PySide6.QtCore import QThread, Qt, QUrl, QTimer, QObject, Signal, Slot
-from PySide6.QtGui import QDesktopServices, QFont, QIcon
+from PySide6.QtGui import QDesktopServices, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QFileDialog, QProgressBar, QListWidget, QListWidgetItem, QMessageBox,
     QTabWidget, QFormLayout, QComboBox, QGroupBox, QTextEdit, QSplitter, QCheckBox, QSpinBox, QFontComboBox,
-    QScrollArea, QFrame, QSystemTrayIcon, QStyle, QProgressDialog)
+    QScrollArea, QFrame, QSystemTrayIcon, QStyle, QProgressDialog, QSlider)
 from .pipeline import AnalyzeWorker, RenderWorker, output_dir_for
-from .media import ffmpeg_available, probe, SUB_PRESETS, SUB_POSITIONS, ACTIVE_COLORS
+from .media import ffmpeg_available, probe, render_preview_frame, SUB_PRESETS, SUB_POSITIONS, ACTIVE_COLORS
 from .updater import (APP_VERSION, DEFAULT_OWNER, DEFAULT_REPO, check_release, download_and_stage, is_newer,
                       UpdateError)
 
@@ -64,6 +64,119 @@ class UpdateDownloadWorker(QObject):
             self.done.emit()
         except Exception as e:
             self.failed.emit(str(e))
+
+
+class PreviewWorker(QObject):
+    done = Signal(str, str, int)    # png path, note, request id
+    failed = Signal(str, int)
+
+    def __init__(self, req: dict):
+        super().__init__(); self.req = req
+
+    @Slot()
+    def run(self):
+        r = self.req
+        try:
+            note = ''
+            cx = None
+            if r.get('speaker'):
+                from .speaker import analyze_active_speaker
+                a, b = max(0.0, r['t'] - 2.5), r['t'] + 2.5
+                sp = analyze_active_speaker(r['source'], a, b, r.get('words') or [])
+                kf = sp.get('keyframes') or []
+                if kf:
+                    rel = r['t'] - a
+                    cx = min(kf, key=lambda k: abs(k[0] - rel))[1]
+                    note = 'кадр по говорящему'
+                else:
+                    note = 'говорящий не найден — весь кадр'
+            out = os.path.join(r['dir'], f"preview_{r['id']}.png")
+            render_preview_frame(r['source'], r['t'], out, words=r.get('words'), zoom=r['zoom'], background=r['background'],
+                                 subtitle_style=r['style'], crop_center_x=cx, info=r.get('info'))
+            self.done.emit(out, note, r['id'])
+        except Exception as e:
+            self.failed.emit(str(e)[:300], r['id'])
+
+
+class PreviewPane(QWidget):
+    """A 9:16 frame of how the clip will look, rendered by the same filters as the real montage."""
+
+    def __init__(self, window, speaker_option: bool = True, hint: str = ''):
+        super().__init__(); self.win = window
+        self.source = ''; self.start = 0.0; self.end = 0.0; self.words = None; self.info = None
+        self._req_id = 0; self._busy = False; self._pending = False; self._threads = []
+        import tempfile
+        self._dir = tempfile.mkdtemp(prefix='cloudy_preview_')
+        v = QVBoxLayout(self); v.setContentsMargins(0, 0, 0, 0)
+        title = QLabel('Превью кадра'); title.setStyleSheet('font-weight:600'); v.addWidget(title)
+        self.image = QLabel(hint or 'Добавьте видео, чтобы увидеть превью'); self.image.setAlignment(Qt.AlignCenter)
+        self.image.setFixedSize(252, 448); self.image.setWordWrap(True)
+        self.image.setStyleSheet('background:#0b0e14;border:1px solid #303b50;border-radius:10px;color:#7f8a9c;padding:12px;')
+        v.addWidget(self.image, 0, Qt.AlignHCenter)
+        self.slider = QSlider(Qt.Horizontal); self.slider.setEnabled(False)
+        self.slider.valueChanged.connect(self._on_slider); v.addWidget(self.slider)
+        self.time_label = QLabel(''); self.time_label.setObjectName('muted'); self.time_label.setAlignment(Qt.AlignCenter); v.addWidget(self.time_label)
+        self.speaker = QCheckBox('По говорящему'); self.speaker.setToolTip('Показать, куда программа повернёт кадр, если найдёт лицо. Считается несколько секунд.')
+        self.speaker.toggled.connect(lambda _: self.request())
+        if speaker_option: v.addWidget(self.speaker)
+        self.note = QLabel(''); self.note.setObjectName('muted'); self.note.setWordWrap(True); v.addWidget(self.note)
+        v.addStretch()
+        self._debounce = QTimer(self); self._debounce.setSingleShot(True); self._debounce.timeout.connect(self._start)
+
+    def set_source(self, source: str | None, start: float = 0.0, end: float | None = None, words=None, at: float | None = None):
+        if not source:
+            self.source = ''; self.slider.setEnabled(False); self.time_label.setText('')
+            self.image.setPixmap(QPixmap()); self.image.setText('Добавьте видео на вкладке «Новый проект», чтобы увидеть превью')
+            return
+        try:
+            if source != self.source or self.info is None: self.info = probe(source)
+        except Exception as e:
+            self.image.setText(f'Не удалось открыть видео:\n{e}'); return
+        self.source, self.words = source, words
+        self.start = max(0.0, float(start)); self.end = float(end) if end else self.info['duration']
+        self.slider.blockSignals(True)
+        self.slider.setRange(0, max(1, int((self.end - self.start) * 10)))
+        pos = (at if at is not None else self.start + min(10.0, (self.end - self.start) / 3)) - self.start
+        self.slider.setValue(int(max(0.0, pos) * 10)); self.slider.blockSignals(False); self.slider.setEnabled(True)
+        self.request()
+
+    def current_time(self) -> float:
+        return self.start + self.slider.value() / 10
+
+    def _on_slider(self, _):
+        self.time_label.setText(_fmt(self.current_time())); self.request(delay=250)
+
+    def request(self, delay: int = 350):
+        if not self.source: return
+        self.time_label.setText(_fmt(self.current_time()))
+        self._debounce.start(delay)
+
+    def _start(self):
+        if self._busy:  # one render at a time; remember that the settings changed meanwhile
+            self._pending = True; return
+        self._busy = True; self._pending = False; self._req_id += 1
+        st = self.win.preview_settings()
+        req = {'id': self._req_id, 'source': self.source, 't': self.current_time(), 'words': self.words,
+               'info': self.info, 'dir': self._dir, 'speaker': self.speaker.isChecked(), **st}
+        self.note.setText('Обновляю…')
+        self._threads = [(t, w) for t, w in self._threads if t.isRunning()]
+        worker = PreviewWorker(req); thread = QThread(); worker.moveToThread(thread)
+        thread.started.connect(worker.run); worker.done.connect(self._on_done); worker.failed.connect(self._on_failed)
+        worker.done.connect(thread.quit); worker.failed.connect(thread.quit)
+        self._threads.append((thread, worker)); thread.start()
+
+    def _finish(self):
+        self._busy = False
+        if self._pending: self._start()
+
+    def _on_done(self, path: str, note: str, rid: int):
+        pm = QPixmap(path)
+        if not pm.isNull():
+            self.image.setPixmap(pm.scaled(self.image.width() - 4, self.image.height() - 4, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self.note.setText(note); self._finish()
+
+    def _on_failed(self, err: str, rid: int):
+        self.note.setText('Не удалось построить превью: ' + err); self._finish()
 
 
 def resource_path(relative: str) -> Path:
@@ -206,7 +319,17 @@ class MainWindow(QMainWindow):
         self.srt = QCheckBox('Сохранять субтитры отдельным файлом .srt (для загрузки на площадку)'); self.srt.setChecked(True); sf.addRow(self.srt)
         lay.addWidget(subs); lay.addStretch()
         self.apply_preset(self.sub_preset.currentText())
-        self.tabs.addTab(self._scroll(tab), 'Оформление')
+        page = QWidget(); h = QHBoxLayout(page); h.setContentsMargins(0, 0, 0, 0)
+        h.addWidget(self._scroll(tab), 1)
+        self.design_preview = PreviewPane(self, speaker_option=True)
+        side = QWidget(); sv = QVBoxLayout(side); sv.addWidget(self.design_preview); side.setFixedWidth(290)
+        h.addWidget(self._scroll(side))
+        for sig in (self.background.currentIndexChanged, self.zoom.currentIndexChanged, self.sub_preset.currentIndexChanged,
+                    self.sub_font.currentFontChanged, self.sub_size.valueChanged, self.sub_pos.currentIndexChanged,
+                    self.sub_color.currentIndexChanged, self.sub_upper.toggled):
+            sig.connect(lambda *_: self.design_preview.request())
+        self.tabs.addTab(page, 'Оформление')
+        self.tabs.currentChanged.connect(self._on_tab_changed)
 
     def _build_select_tab(self):
         tab = QWidget(); lay = QVBoxLayout(tab)
@@ -214,7 +337,12 @@ class MainWindow(QMainWindow):
         split = QSplitter(Qt.Horizontal)
         self.cand_list = QListWidget(); self.cand_list.currentRowChanged.connect(self.show_candidate)
         self.cand_list.itemDoubleClicked.connect(self._toggle_item); split.addWidget(self.cand_list)
-        self.cand_detail = QTextEdit(); self.cand_detail.setReadOnly(True); split.addWidget(self.cand_detail); split.setSizes([480, 560])
+        right = QWidget(); rh = QHBoxLayout(right); rh.setContentsMargins(0, 0, 0, 0)
+        self.select_preview = PreviewPane(self, speaker_option=True, hint='Выберите момент слева')
+        pw = QWidget(); pv = QVBoxLayout(pw); pv.setContentsMargins(0, 0, 0, 0); pv.addWidget(self.select_preview); pw.setFixedWidth(270)
+        rh.addWidget(pw)
+        self.cand_detail = QTextEdit(); self.cand_detail.setReadOnly(True); rh.addWidget(self.cand_detail, 1)
+        split.addWidget(right); split.setSizes([380, 700])
         lay.addWidget(split, 1)
         row = QHBoxLayout()
         b = QPushButton('Выбрать все'); b.clicked.connect(lambda: self._check_all(True)); row.addWidget(b)
@@ -271,6 +399,28 @@ class MainWindow(QMainWindow):
     def subtitle_style(self) -> dict:
         return {'preset': self.sub_preset.currentText(), 'font': self.sub_font.currentFont().family(), 'size': self.sub_size.value(),
                 'position': self.sub_pos.currentText(), 'active': ACTIVE_COLORS[self.sub_color.currentText()], 'upper': self.sub_upper.isChecked()}
+
+    def preview_settings(self) -> dict:
+        return {'zoom': int(self.zoom.currentText().split('%')[0]) / 100,
+                'background': 'black' if self.background.currentIndex() == 1 else 'blur',
+                'style': self.subtitle_style()}
+
+    def _on_tab_changed(self, index: int):
+        if index == 1: self._sync_design_preview()
+
+    def _sync_design_preview(self):
+        """Preview the first video in the list; use its saved transcript for real captions if there is one."""
+        src = self.sources[0] if self.sources else ''
+        if not src:
+            self.design_preview.set_source(None); return
+        if src == self.design_preview.source: self.design_preview.request(); return
+        words = None
+        try:
+            cache = Path(output_dir_for(self.out_edit.text().strip(), src)) / 'transcript_cache.json'
+            if cache.exists(): words = json.loads(cache.read_text(encoding='utf-8')).get('words')
+        except Exception:
+            words = None
+        self.design_preview.set_source(src, words=words)
 
     def collect_settings(self) -> dict:
         return {'whisper_model': self.whisper.currentText(), 'device': self.device.currentText(),
@@ -412,6 +562,7 @@ class MainWindow(QMainWindow):
                 self.sources.append(p); self.src_list.addItem(p); added += 1
         if added and not self.cancel_btn.isEnabled():
             self.status.setText(f'Видео в списке: {len(self.sources)}. Нажмите «Начать обработку».')
+        if added: self._sources_changed()
         return added
 
     def pick_sources(self):
@@ -426,12 +577,17 @@ class MainWindow(QMainWindow):
         if self.add_sources([u.toLocalFile() for u in e.mimeData().urls()]):
             self.tabs.setCurrentIndex(0)
 
+    def _sources_changed(self):
+        if self.tabs.currentIndex() == 1: self._sync_design_preview()
+
     def remove_source(self):
         row = self.src_list.currentRow()
         if row >= 0: self.sources.pop(row); self.src_list.takeItem(row)
+        self._sources_changed()
 
     def clear_sources(self):
         self.sources.clear(); self.src_list.clear()
+        self._sources_changed()
 
     def pick_banner(self):
         p, _ = QFileDialog.getOpenFileName(self, 'Выберите анимационный баннер', '', 'Видео/GIF (*.mp4 *.mov *.webm *.gif *.mkv)')
@@ -586,6 +742,7 @@ class MainWindow(QMainWindow):
     def show_candidate(self, row: int):
         if not self.analysis or row < 0 or row >= len(self.analysis['clips']): return
         c = self.analysis['clips'][row]
+        self.select_preview.set_source(self.analysis['source'], c['start'], c['end'], self.analysis['words'])
         self.cand_detail.setPlainText(f"Отрезок исходника: {_fmt(c['start'])}–{_fmt(c['end'])}\nОценка: {c.get('score', 0):.0f}/100\n"
                                       f"Почему: {c.get('reason') or '—'}\nХук: {c.get('hook') or '—'}\n\nТекст:\n{c.get('transcript', '')}")
 

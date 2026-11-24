@@ -648,6 +648,67 @@ def _zoom_expression(punches: list[float], amount: float = 0.12) -> str:
 
 # --------------------------------------------------------------------------- render
 
+def _framing(head: str, info: dict, crop_x_expr: str | None, zoom: float, background: str) -> str:
+    """Filter chain that turns the source picture into a 1080x1920 frame, ending in label [fr].
+
+    crop_x_expr: speaker-tracking crop (x of the 9:16 window, may depend on t); None = fit with zoom.
+    Shared by the real render and by the preview, so the preview shows exactly what you get.
+    """
+    if crop_x_expr is not None:
+        crop_w = max(2, int(info['height'] * 9 / 16) // 2 * 2)
+        return f"{head},crop={crop_w}:{info['height'] // 2 * 2}:'{crop_x_expr}':0,scale={OUT_W}:{OUT_H},setsar=1[fr]"
+    # zoom > 1 enlarges a landscape picture: sides are cropped a little, the bars shrink.
+    z = max(1.0, min(3.0, float(zoom)))
+    fg = (f"scale=w='trunc(min({OUT_W * z:.1f}/iw\\,{OUT_H}/ih)*iw/2)*2':h=-2,"
+          f"crop='min(iw\\,{OUT_W})':'min(ih\\,{OUT_H})'")
+    if background == 'blur':
+        # Blurred, darkened copy of the same picture fills the bars (cheap: blurred at 1/4 size).
+        return (f"{head},split=2[fgsrc][bgsrc];"
+                f"[bgsrc]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,"
+                f"gblur=sigma=10,eq=brightness=-0.12:saturation=1.1,scale={OUT_W}:{OUT_H},setsar=1[bg];"
+                f"[fgsrc]{fg},setsar=1[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2[fr]")
+    return f"{head},{fg},pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[fr]"
+
+
+SAMPLE_CAPTION = ['Так', 'будут', 'выглядеть', 'субтитры', 'в', 'ролике.']
+
+
+def render_preview_frame(source: str, t: float, out_png: str, words: list[dict] | None = None,
+                         zoom: float = 1.3, background: str = 'blur', subtitle_style: dict | None = None,
+                         crop_center_x: float | None = None, info: dict | None = None) -> str:
+    """One finished-looking 1080x1920 frame at source time t (framing + background + captions).
+
+    words: real transcript words (captions of that moment are shown, current word highlighted);
+    without them a sample caption is drawn so the style can still be judged.
+    """
+    info = info or probe(source)
+    t = max(0.0, min(float(t), max(0.0, info['duration'] - 0.05)))
+    with tempfile.TemporaryDirectory(prefix='cloudy_prev_') as td:
+        near = [w for w in (words or []) if float(w['end']) > t - 4 and float(w['start']) < t + 4]
+        if near:
+            # Put the moment t at 0: the caption chunk that is on screen at t is drawn on the frame.
+            shifted = [{'start': float(w['start']) - t, 'end': float(w['end']) - t, 'word': w['word']} for w in near]
+            on_screen = [w for w in shifted if w['start'] <= 0.05]
+            if not on_screen or on_screen[-1]['end'] < -0.6:  # pause right now → show the next phrase
+                nxt = [w for w in shifted if w['start'] > 0]
+                if nxt:
+                    d = nxt[0]['start'] - 0.01
+                    shifted = [{**w, 'start': w['start'] - d, 'end': w['end'] - d} for w in shifted]
+        else:
+            shifted = [{'start': i * 0.3 - 0.4, 'end': i * 0.3 - 0.15, 'word': ' ' + w} for i, w in enumerate(SAMPLE_CAPTION)]
+        ass = os.path.join(td, 'p.ass')
+        write_ass(ass, shifted, 10.0, subtitle_style)
+        expr = None
+        if crop_center_x is not None and info['width'] / max(1, info['height']) > 9 / 16:
+            crop_w = max(2, int(info['height'] * 9 / 16) // 2 * 2)
+            expr = f'{max(0.0, min(float(crop_center_x) - crop_w / 2, info["width"] - crop_w)):.1f}'
+        graph = _framing('[0:v]setpts=PTS-STARTPTS', info, expr, zoom, background)
+        graph += f";[fr]ass='{_ffmpeg_filter_path(ass)}'[v]"
+        run([ffmpeg_path(), '-y', '-ss', f'{t:.3f}', '-i', source, '-filter_complex', graph, '-map', '[v]',
+             '-frames:v', '1', out_png])
+    return out_png
+
+
 def _render_base(source: str, out: str, clip_start: float, clip_dur: float, keep: list[tuple[float, float]],
                  crop_keyframes: list[tuple[float, float]] | None, info: dict, zoom: float = 1.0,
                  background: str = 'blur', punches: list[float] | None = None,
@@ -661,23 +722,10 @@ def _render_base(source: str, out: str, clip_start: float, clip_dur: float, keep
     lo, hi = 0.25 / FPS, 0.75 / FPS
     sel = '+'.join(f'between(t\\,{a - lo:.4f}\\,{b - hi:.4f})' for a, b in keep)
     head = f"[0:v]setpts=PTS-STARTPTS,fps={FPS},select='{sel}',setpts=N/{FPS}/TB"
+    expr = None
     if crop_keyframes and info['width'] / max(1, info['height']) > 9 / 16:
-        crop_w = max(2, int(info['height'] * 9 / 16) // 2 * 2)
-        expr = _crop_expression(crop_keyframes, crop_w, info['width'])
-        video = f"{head},crop={crop_w}:{info['height'] // 2 * 2}:'{expr}':0,scale={OUT_W}:{OUT_H},setsar=1[fr]"
-    else:
-        # zoom > 1 enlarges a landscape picture: sides are cropped a little, the bars shrink.
-        z = max(1.0, min(3.0, float(zoom)))
-        fg = (f"scale=w='trunc(min({OUT_W * z:.1f}/iw\\,{OUT_H}/ih)*iw/2)*2':h=-2,"
-              f"crop='min(iw\\,{OUT_W})':'min(ih\\,{OUT_H})'")
-        if background == 'blur':
-            # Blurred, darkened copy of the same picture fills the bars (cheap: blurred at 1/4 size).
-            video = (f"{head},split=2[fgsrc][bgsrc];"
-                     f"[bgsrc]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,"
-                     f"gblur=sigma=10,eq=brightness=-0.12:saturation=1.1,scale={OUT_W}:{OUT_H},setsar=1[bg];"
-                     f"[fgsrc]{fg},setsar=1[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2[fr]")
-        else:
-            video = f"{head},{fg},pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1[fr]"
+        expr = _crop_expression(crop_keyframes, max(2, int(info['height'] * 9 / 16) // 2 * 2), info['width'])
+    video = _framing(head, info, expr, zoom, background)
     if punches:
         video += (f";[fr]zoompan=z='{_zoom_expression(punches)}':d=1:x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':"
                   f"s={OUT_W}x{OUT_H}:fps={FPS},format=yuv420p[v]")
