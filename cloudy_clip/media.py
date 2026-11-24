@@ -493,6 +493,56 @@ def _sentence_chunks(sents: list[dict], max_tokens: int, overlap_seconds: float)
     return chunks
 
 
+def fit_centered(sents: list[dict], s: int, e: int, tmin: float, tmax: float) -> tuple[int, int] | None:
+    """Like fit_to_sentences, but grows a too-short range on BOTH sides around the moment the model chose,
+    so neighbouring short picks do not all swell forward into each other."""
+    s = max(0, min(s, len(sents) - 1)); e = max(s, min(e, len(sents) - 1))
+    dur = lambda: sents[e]['end'] - sents[s]['start']
+    turn = 0
+    while dur() < tmin:
+        if (turn % 2 == 0 and e + 1 < len(sents)) or s == 0:
+            if e + 1 >= len(sents): return None
+            e += 1
+        else:
+            s -= 1
+        turn += 1
+    while dur() > tmax and e > s:
+        e -= 1
+    return (s, e) if tmin <= dur() <= tmax else None
+
+
+def _parse_ranges(items: list, chunk: list[dict], sents: list[dict]) -> tuple[list[tuple[int, int, dict]], list[str]]:
+    """Turn model answers into (start_id, end_id, item). Tolerates local numbering and seconds."""
+    lo, hi = chunk[0]['id'], chunk[-1]['id']
+    out, problems = [], []
+
+    def by_time(t: float) -> int | None:
+        for x in chunk:
+            if x['end'] >= t: return x['id']
+        return None
+
+    for c in items:
+        if not isinstance(c, dict): problems.append('не объект'); continue
+        s_id = e_id = None
+        try:
+            s_id, e_id = int(c.get('start_id')), int(c.get('end_id'))
+        except (TypeError, ValueError):
+            pass
+        if s_id is not None and not (lo <= s_id <= hi) and 0 <= s_id <= hi - lo and 0 <= (e_id or 0) <= hi - lo:
+            s_id, e_id = lo + s_id, lo + e_id            # numbered from 0 inside the part
+        if s_id is None or not (lo <= s_id <= hi):
+            try:                                       # seconds instead of phrase numbers
+                st, en = float(c.get('start')), float(c.get('end'))
+                s_id, e_id = by_time(st), by_time(en)
+            except (TypeError, ValueError):
+                pass
+        if s_id is None or e_id is None or not (lo <= s_id <= hi):
+            problems.append(f'номера вне части: {c.get("start_id")}–{c.get("end_id")}'); continue
+        if e_id < s_id: s_id, e_id = e_id, s_id
+        out.append((s_id, min(e_id, hi), c))
+    return out, problems
+
+
 def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: str = 'http://127.0.0.1:11434', model: str = 'qwen3:4b',
               target_min: int = 90, target_max: int = 150, use_local_ai: bool = True,
               notice_callback: Callable[[str], None] | None = None,
@@ -502,65 +552,90 @@ def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: s
 
     The model sees numbered phrases and answers with phrase numbers, not seconds,
     so it cannot invent timecodes, and every clip starts/ends on a phrase border.
+    Parts are short (~7 min) for a small model; a part that yields too few clips gets a
+    second request for more, excluding what was already chosen. A log of every step is kept.
     """
     if not words: return []
     if not use_local_ai:
         return fallback_clips(words, target_min, target_max)
     sents = build_sentences(words)
-    errors, valid = [], []
-    chunks = _sentence_chunks(sents, max_tokens=9000, overlap_seconds=target_max)
-    for n, chunk in enumerate(chunks, 1):
-        if notice_callback: notice_callback(f'Локальный AI: часть {n}/{len(chunks)}')
+    errors, chosen, log = [], [], []
+    chunks = _sentence_chunks(sents, max_tokens=4500, overlap_seconds=target_max * 0.6)
+
+    def ask(chunk, n, want_min, exclude):
         lines = '\n'.join(f"{s['id']}. [{s['start']:.1f}-{s['end']:.1f}] {s['text']}" for s in chunk)
-        span = chunk[-1]['end'] - chunk[0]['start']
-        want_min = max(2, min(8, int(span / 180)))   # about one clip per 3 minutes of the part
+        avg = max(1.0, (chunk[-1]['end'] - chunk[0]['start']) / max(1, len(chunk)))
+        p_lo, p_hi = max(3, int(target_min / avg)), max(4, int(target_max / avg))
+        excl = ''
+        if exclude:
+            excl = ('Эти диапазоны уже выбраны, НЕ повторяй и не пересекайся с ними: '
+                    + ', '.join(f'{a}–{b}' for a, b in exclude) + '. Найди ДРУГИЕ хорошие фрагменты.\n')
         prompt = (
             'Ниже расшифровка видео, разбитая на пронумерованные фразы с таймкодами в секундах.\n'
-            f'Выбери от {want_min} до 8 хороших самостоятельных фрагментов для TikTok/Shorts из РАЗНЫХ мест всей расшифровки '
-            f'(от начала до конца, не только первые минуты). Каждый фрагмент — непрерывный диапазон фраз '
-            f'от start_id до end_id длительностью от {target_min} до {target_max} секунд (считай по таймкодам).\n'
-            'Фрагмент должен начинаться с начала мысли и заканчиваться законченной мыслью, быть понятным без остального видео.\n'
-            'Ищи законченные истории, юмор, эмоции, неожиданные повороты, сильные мысли и интригу. Фрагменты не должны пересекаться.\n'
+            f'Выбери от {want_min} до 6 хороших самостоятельных фрагментов для TikTok/Shorts из разных мест этой расшифровки.\n'
+            f'Каждый фрагмент — непрерывный диапазон фраз от start_id до end_id длительностью от {target_min} до {target_max} секунд: '
+            f'это примерно {p_lo}–{p_hi} фраз подряд. Используй номера фраз точно как в списке (от {chunk[0]["id"]} до {chunk[-1]["id"]}).\n'
+            'Фрагмент начинается с начала мысли, заканчивается законченной мыслью и понятен без остального видео. '
+            'Ищи истории, юмор, эмоции, неожиданные повороты, сильные мысли, интригу. Фрагменты не пересекаются.\n' + excl +
             'Верни JSON: {"clips": [{"start_id": 0, "end_id": 0, "title": "короткое название", '
-            '"hook": "дословная цепляющая фраза из фрагмента", "score": 1-100, "reason": "почему это интересно"}]}\n'
-            'Пиши компактно, без отступов и переносов строк: title — до 8 слов, hook — до 12 слов, reason — до 10 слов.\n\n'
+            '"hook": "дословная цепляющая фраза", "score": 1-100, "reason": "почему интересно"}]}\n'
+            'Пиши компактно, без отступов: title — до 8 слов, hook — до 12 слов, reason — до 10 слов.\n\n'
             'Фразы:\n' + lines)
+        note = (lambda k: notice_callback(f'Локальный AI: часть {n}/{len(chunks)} · ответ модели: {k} токенов')) if notice_callback else None
+        raw = _strip_model_output(_ollama_chat(base_url, model, prompt, max_tokens=3000, on_tokens=note, cancel=cancel))
+        if debug_dir:
+            try:
+                with open(Path(debug_dir, f'ai_answer_part{n}.txt'), 'a', encoding='utf-8') as f: f.write(raw + '\n\n')
+            except OSError: pass
         try:
-            tokens_note = (lambda k, n=n: notice_callback(f'Локальный AI: часть {n}/{len(chunks)} · ответ модели: {k} токенов')) \
-                if notice_callback else None
-            raw = _strip_model_output(_ollama_chat(base_url, model, prompt, max_tokens=4000, on_tokens=tokens_note, cancel=cancel))
-            if debug_dir:  # keep the raw answer: if the model misbehaves we can see what it wrote
-                try: Path(debug_dir, f'ai_answer_part{n}.txt').write_text(raw, encoding='utf-8')
-                except OSError: pass
+            return _extract_clip_list(json.loads(raw))
+        except ValueError:
+            items = _salvage_objects(raw)      # answer was cut off: keep every fully written clip
+            if not items: raise
+            return items
+
+    if debug_dir:
+        for old in Path(debug_dir).glob('ai_answer_part*.txt'):
+            try: old.unlink()
+            except OSError: pass
+    for n, chunk in enumerate(chunks, 1):
+        if notice_callback: notice_callback(f'Локальный AI: часть {n}/{len(chunks)}')
+        span = chunk[-1]['end'] - chunk[0]['start']
+        want_min = max(1, min(4, round(span / 150)))      # about one clip per 2.5 minutes
+        accepted_here = []
+        for attempt in (1, 2):
+            exclude = [(a, b) for a, b, _ in accepted_here]
             try:
-                items = _extract_clip_list(json.loads(raw))
-            except ValueError:
-                items = _salvage_objects(raw)   # answer was cut off: keep every fully written clip
-                if not items: raise
-        except Cancelled:
-            raise
-        except Exception as exc:
-            errors.append(str(exc)[:150])
-            if isinstance(exc, RuntimeError) and 'Ollama не запущен' in str(exc): break
-            continue
-        lo, hi = chunk[0]['id'], chunk[-1]['id']
-        for c in items:
-            if not isinstance(c, dict): continue
-            try:
-                s_id, e_id = int(c.get('start_id')), int(c.get('end_id'))
-            except (TypeError, ValueError):
+                items = ask(chunk, n, want_min, exclude)
+            except Cancelled:
+                raise
+            except Exception as exc:
+                errors.append(str(exc)[:150]); log.append(f'часть {n}, попытка {attempt}: ошибка {str(exc)[:150]}')
+                if isinstance(exc, RuntimeError) and 'Ollama не запущен' in str(exc): break
                 continue
-            if not (lo <= s_id <= hi) or e_id < s_id: continue
-            fit = fit_to_sentences(sents, s_id, min(e_id, len(sents) - 1), target_min, target_max)
-            if not fit: continue
-            a, b = fit
-            try: score = max(1.0, min(100.0, float(c.get('score', 50))))
-            except (TypeError, ValueError): score = 50.0
-            valid.append({'start': sents[a]['start'], 'end': sents[b]['end'],
-                          'title': str(c.get('title') or '').strip(), 'hook': str(c.get('hook') or '').strip(),
-                          'score': score, 'reason': str(c.get('reason') or '').strip(),
-                          'transcript': ' '.join(x['text'] for x in sents[a:b + 1])})
-    unique = _dedupe(valid, 0.3)
+            ranges, problems = _parse_ranges(items, chunk, sents)
+            added = 0; overl = 0; nofit = 0
+            for s_id, e_id, c in ranges:
+                fit = fit_centered(sents, s_id, e_id, target_min, target_max)
+                if not fit: nofit += 1; continue
+                a, b = fit
+                cand = {'start': sents[a]['start'], 'end': sents[b]['end']}
+                if any(_overlap_ratio(cand, x) >= 0.3 for x in chosen): overl += 1; continue
+                try: score = max(1.0, min(100.0, float(c.get('score', 50))))
+                except (TypeError, ValueError): score = 50.0
+                clip = {**cand, 'title': str(c.get('title') or '').strip(), 'hook': str(c.get('hook') or '').strip(),
+                        'score': score, 'reason': str(c.get('reason') or '').strip(),
+                        'transcript': ' '.join(x['text'] for x in sents[a:b + 1])}
+                chosen.append(clip); accepted_here.append((a, b, clip)); added += 1
+            log.append(f'часть {n} ({_fmt_min(chunk[0]["start"])}–{_fmt_min(chunk[-1]["end"])}), попытка {attempt}: '
+                       f'предложено {len(items)}, принято {added}, пересеклись {overl}, не подошла длина {nofit}'
+                       + (f', непонятные номера: {len(problems)}' if problems else ''))
+            if len(accepted_here) >= want_min: break
+        if errors and 'Ollama не запущен' in errors[-1]: break
+    if debug_dir:
+        try: Path(debug_dir, 'ai_log.txt').write_text('\n'.join(log), encoding='utf-8')
+        except OSError: pass
+    unique = sorted(chosen, key=lambda c: c['start'])
     if unique:
         if fill:  # "as many as possible": add non-overlapping offline windows from the rest of the video
             extra = fallback_clips(words, target_min, target_max, taken=[(c['start'], c['end']) for c in unique])
@@ -572,6 +647,10 @@ def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: s
     why = '; '.join(errors) if errors else 'модель не вернула подходящих фрагментов'
     for c in clips: c['reason'] = 'Офлайн-резерв (AI не сработал: ' + why[:150] + ')'
     return clips
+
+
+def _fmt_min(t: float) -> str:
+    t = int(t); return f'{t // 60}:{t % 60:02}'
 
 
 def ai_metadata(transcript: str, base_url: str = 'http://127.0.0.1:11434', model: str = 'qwen3:4b') -> dict | None:

@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
     QPushButton, QLineEdit, QFileDialog, QProgressBar, QListWidget, QListWidgetItem, QMessageBox,
     QTabWidget, QFormLayout, QComboBox, QGroupBox, QTextEdit, QSplitter, QCheckBox, QSpinBox, QFontComboBox,
     QScrollArea, QFrame, QSystemTrayIcon, QStyle, QProgressDialog, QSlider, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView)
+    QHeaderView, QAbstractItemView, QSizePolicy)
 from .pipeline import AnalyzeWorker, RenderWorker, output_dir_for, data_dir_for
 from .media import (ffmpeg_available, probe, render_preview_frame, build_sentences, which, NO_WINDOW,
                     SUB_PRESETS, SUB_POSITIONS, ACTIVE_COLORS)
@@ -501,7 +501,9 @@ class MainWindow(QMainWindow):
         self.progress_label = QLabel('Перетащите видео в окно или нажмите «Выбрать файлы».'); self.progress_label.setObjectName('muted')
         self.queue_label = QLabel(''); self.queue_label.setObjectName('muted')
         self.eta_label = QLabel(''); self.eta_label.setObjectName('eta')
-        info.addWidget(self.progress_label, 1); info.addWidget(self.queue_label); info.addWidget(self.eta_label)
+        for lab in (self.progress_label, self.queue_label, self.eta_label):
+            lab.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred); lab.setMinimumWidth(40)   # long texts never widen the window
+        info.addWidget(self.progress_label, 5); info.addWidget(self.queue_label, 2); info.addWidget(self.eta_label, 3)
         mid.addWidget(self.progress); mid.addLayout(info); h.addLayout(mid, 1)
         self.cancel_btn = QPushButton('Отменить'); self.cancel_btn.setObjectName('ghost'); self.cancel_btn.setEnabled(False)
         self.cancel_btn.setMinimumHeight(44); self.cancel_btn.clicked.connect(self.cancel_processing)
@@ -609,7 +611,7 @@ class MainWindow(QMainWindow):
         self.cand_list.setWordWrap(True); self.cand_list.setSpacing(6); self.cand_list.setUniformItemSizes(True)
         self.cand_list.currentRowChanged.connect(self.show_candidate); self.cand_list.itemDoubleClicked.connect(self._toggle_item)
         self.cand_list.itemChanged.connect(lambda *_: self._update_pick_count())
-        split.addWidget(self.cand_list)
+        self.cand_list.setMinimumWidth(190); split.addWidget(self.cand_list)
         right = QFrame(); right.setObjectName('card'); rh = QHBoxLayout(right); rh.setContentsMargins(14, 14, 14, 14); rh.setSpacing(12)
         self.select_preview = PreviewPane(self, speaker_option=True, hint='Выберите момент слева')
         pw = QWidget(); pv = QVBoxLayout(pw); pv.setContentsMargins(0, 0, 0, 0); pv.addWidget(self.select_preview)
@@ -618,7 +620,7 @@ class MainWindow(QMainWindow):
         self.cand_detail = QTextEdit(); self.cand_detail.setReadOnly(True)
         self.caption_editor = CaptionEditor(self)
         self.detail_tabs = QTabWidget(); self.detail_tabs.addTab(self.cand_detail, 'Описание'); self.detail_tabs.addTab(self.caption_editor, 'Субтитры')
-        rh.addWidget(self.detail_tabs, 1)
+        self.detail_tabs.setMinimumWidth(220); rh.addWidget(self.detail_tabs, 1)
         split.addWidget(right); split.setStretchFactor(0, 3); split.setStretchFactor(1, 4); split.setSizes([520, 700])
         lay.addWidget(split, 1)
         row = QHBoxLayout()
@@ -1066,7 +1068,7 @@ class MainWindow(QMainWindow):
 
     def on_progress(self, p, msg):
         self.progress.setValue(p)
-        self.stepper.set_step(0 if p < 38 else 1 if p < 50 else 2)
+        self.stepper.set_step(0 if p < 38 else 1 if p <= 50 else 2)
         if msg: self.progress_label.setText(msg)
         self.setWindowTitle(f'{p}% — Cloudy Clip Studio')  # visible on the taskbar while minimised
 
