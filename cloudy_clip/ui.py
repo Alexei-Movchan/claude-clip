@@ -113,13 +113,14 @@ class PreviewPane(QWidget):
         self.image.setFixedSize(252, 448); self.image.setWordWrap(True)
         self.image.setStyleSheet('background:#0b0e14;border:1px solid #303b50;border-radius:10px;color:#7f8a9c;padding:12px;')
         v.addWidget(self.image, 0, Qt.AlignHCenter)
-        self.slider = QSlider(Qt.Horizontal); self.slider.setEnabled(False)
+        self.slider = QSlider(Qt.Horizontal); self.slider.setEnabled(False); self.slider.setFixedWidth(252)
         self.slider.valueChanged.connect(self._on_slider); v.addWidget(self.slider)
         self.time_label = QLabel(''); self.time_label.setObjectName('muted'); self.time_label.setAlignment(Qt.AlignCenter); v.addWidget(self.time_label)
         self.speaker = QCheckBox('По говорящему'); self.speaker.setToolTip('Показать, куда программа повернёт кадр, если найдёт лицо. Считается несколько секунд.')
         self.speaker.toggled.connect(lambda _: self.request())
+        self.speaker.toggled.connect(lambda on: self.win.sync_preview_speaker(on, self))
         if speaker_option: v.addWidget(self.speaker)
-        self.note = QLabel(''); self.note.setObjectName('muted'); self.note.setWordWrap(True); v.addWidget(self.note)
+        self.note = QLabel(''); self.note.setObjectName('muted'); self.note.setWordWrap(True); self.note.setFixedWidth(252); v.addWidget(self.note)
         v.addStretch()
         self._debounce = QTimer(self); self._debounce.setSingleShot(True); self._debounce.timeout.connect(self._start)
 
@@ -157,7 +158,8 @@ class PreviewPane(QWidget):
         self._busy = True; self._pending = False; self._req_id += 1
         st = self.win.preview_settings()
         req = {'id': self._req_id, 'source': self.source, 't': self.current_time(), 'words': self.words,
-               'info': self.info, 'dir': self._dir, 'speaker': self.speaker.isChecked(), **st}
+               'info': self.info, 'dir': self._dir,
+               'speaker': self.speaker.isChecked() and self.win.speaker_crop.isChecked(), **st}
         self.note.setText('Обновляю…')
         self._threads = [(t, w) for t, w in self._threads if t.isRunning()]
         worker = PreviewWorker(req); thread = QThread(); worker.moveToThread(thread)
@@ -173,6 +175,9 @@ class PreviewPane(QWidget):
         pm = QPixmap(path)
         if not pm.isNull():
             self.image.setPixmap(pm.scaled(self.image.width() - 4, self.image.height() - 4, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        if not note and self.win.speaker_crop.isChecked():
+            note = ('Показан весь кадр с фоном. В ролике, если программа найдёт лицо, кадр будет на весь экран — '
+                    'включите «По говорящему», чтобы увидеть.')
         self.note.setText(note); self._finish()
 
     def _on_failed(self, err: str, rid: int):
@@ -308,6 +313,8 @@ class MainWindow(QMainWindow):
                    'Если программа уверенно нашла говорящего, кадр заполняет весь экран.'); n.setWordWrap(True); n.setObjectName('muted'); ff.addRow(n)
         self.hook = QCheckBox('Хук: самая цепляющая фраза ролика в первые секунды'); self.hook.setChecked(True); ff.addRow(self.hook)
         self.punch = QCheckBox('Приближения на громких и эмоциональных моментах'); self.punch.setChecked(True); ff.addRow(self.punch)
+        self.speaker_crop = QCheckBox('Кадрирование по говорящему: если найдено лицо, кадр заполняет весь экран и следует за ним')
+        self.speaker_crop.setChecked(True); ff.addRow(self.speaker_crop)
         lay.addWidget(frame)
         subs = QGroupBox('Субтитры'); sf = QFormLayout(subs)
         self.sub_preset = QComboBox(); self.sub_preset.addItems(list(SUB_PRESETS)); self.sub_preset.currentTextChanged.connect(self.apply_preset); sf.addRow('Стиль', self.sub_preset)
@@ -322,11 +329,12 @@ class MainWindow(QMainWindow):
         page = QWidget(); h = QHBoxLayout(page); h.setContentsMargins(0, 0, 0, 0)
         h.addWidget(self._scroll(tab), 1)
         self.design_preview = PreviewPane(self, speaker_option=True)
-        side = QWidget(); sv = QVBoxLayout(side); sv.addWidget(self.design_preview); side.setFixedWidth(290)
-        h.addWidget(self._scroll(side))
+        side = QWidget(); sv = QVBoxLayout(side); sv.setContentsMargins(6, 0, 6, 0); sv.addWidget(self.design_preview)
+        side_area = self._scroll(side); side_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); side_area.setFixedWidth(290)
+        h.addWidget(side_area)
         for sig in (self.background.currentIndexChanged, self.zoom.currentIndexChanged, self.sub_preset.currentIndexChanged,
                     self.sub_font.currentFontChanged, self.sub_size.valueChanged, self.sub_pos.currentIndexChanged,
-                    self.sub_color.currentIndexChanged, self.sub_upper.toggled):
+                    self.sub_color.currentIndexChanged, self.sub_upper.toggled, self.speaker_crop.toggled):
             sig.connect(lambda *_: self.design_preview.request())
         self.tabs.addTab(page, 'Оформление')
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -339,8 +347,9 @@ class MainWindow(QMainWindow):
         self.cand_list.itemDoubleClicked.connect(self._toggle_item); split.addWidget(self.cand_list)
         right = QWidget(); rh = QHBoxLayout(right); rh.setContentsMargins(0, 0, 0, 0)
         self.select_preview = PreviewPane(self, speaker_option=True, hint='Выберите момент слева')
-        pw = QWidget(); pv = QVBoxLayout(pw); pv.setContentsMargins(0, 0, 0, 0); pv.addWidget(self.select_preview); pw.setFixedWidth(270)
-        rh.addWidget(pw)
+        pw = QWidget(); pv = QVBoxLayout(pw); pv.setContentsMargins(6, 0, 6, 0); pv.addWidget(self.select_preview)
+        pw_area = self._scroll(pw); pw_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); pw_area.setFixedWidth(290)
+        rh.addWidget(pw_area)
         self.cand_detail = QTextEdit(); self.cand_detail.setReadOnly(True); rh.addWidget(self.cand_detail, 1)
         split.addWidget(right); split.setSizes([380, 700])
         lay.addWidget(split, 1)
@@ -400,6 +409,11 @@ class MainWindow(QMainWindow):
         return {'preset': self.sub_preset.currentText(), 'font': self.sub_font.currentFont().family(), 'size': self.sub_size.value(),
                 'position': self.sub_pos.currentText(), 'active': ACTIVE_COLORS[self.sub_color.currentText()], 'upper': self.sub_upper.isChecked()}
 
+    def sync_preview_speaker(self, on: bool, origin):
+        for pane in (getattr(self, 'design_preview', None), getattr(self, 'select_preview', None)):
+            if pane is not None and pane is not origin and pane.speaker.isChecked() != on:
+                pane.speaker.blockSignals(True); pane.speaker.setChecked(on); pane.speaker.blockSignals(False)
+
     def preview_settings(self) -> dict:
         return {'zoom': int(self.zoom.currentText().split('%')[0]) / 100,
                 'background': 'black' if self.background.currentIndex() == 1 else 'blur',
@@ -429,6 +443,7 @@ class MainWindow(QMainWindow):
                 'zoom': int(self.zoom.currentText().split('%')[0]) / 100,
                 'background': 'black' if self.background.currentIndex() == 1 else 'blur',
                 'hook': self.hook.isChecked(), 'punch_ins': self.punch.isChecked(), 'srt': self.srt.isChecked(),
+                'speaker_crop': self.speaker_crop.isChecked(),
                 'ai_descriptions': self.ai_desc.isChecked(), 'manual_pick': self.manual_pick.isChecked(),
                 'subtitle_style': self.subtitle_style()}
 
@@ -450,7 +465,7 @@ class MainWindow(QMainWindow):
         for key, widget in (('encoder', self.encoder), ('background', self.background)):
             if isinstance(ui.get(key), int): widget.setCurrentIndex(ui[key])
         for key, widget in (('manual_pick', self.manual_pick), ('ai_desc', self.ai_desc), ('hook', self.hook),
-                            ('punch', self.punch), ('srt', self.srt)):
+                            ('punch', self.punch), ('srt', self.srt), ('speaker_crop', self.speaker_crop)):
             if key in ui: widget.setChecked(bool(ui[key]))
         st = ui.get('subtitles') or {}
         if st.get('preset') in SUB_PRESETS: self.sub_preset.setCurrentText(st['preset'])
@@ -461,6 +476,9 @@ class MainWindow(QMainWindow):
         if color: self.sub_color.setCurrentText(color)
         if 'upper' in st: self.sub_upper.setChecked(bool(st['upper']))
         if ui.get('out_dir'): self.out_edit.setText(ui['out_dir'])
+        if 'preview_speaker' in ui:
+            for pane in (self.design_preview, self.select_preview):
+                pane.speaker.blockSignals(True); pane.speaker.setChecked(bool(ui['preview_speaker'])); pane.speaker.blockSignals(False)
 
     def save_settings(self, notify: bool = False):
         d = {'use_local_ai': True, 'local_model': self.local_model.currentText().strip(), 'ollama_url': self.ollama_url.text().strip(),
@@ -471,6 +489,7 @@ class MainWindow(QMainWindow):
                     'encoder': self.encoder.currentIndex(), 'background': self.background.currentIndex(),
                     'manual_pick': self.manual_pick.isChecked(), 'ai_desc': self.ai_desc.isChecked(), 'hook': self.hook.isChecked(),
                     'punch': self.punch.isChecked(), 'srt': self.srt.isChecked(), 'subtitles': self.subtitle_style(),
+                    'speaker_crop': self.speaker_crop.isChecked(), 'preview_speaker': self.design_preview.speaker.isChecked(),
                     'out_dir': self.out_edit.text().strip()}}
         (Path.home() / '.cloudy_clip_studio.json').write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8')
         if notify: QMessageBox.information(self, 'Настройки', 'Сохранено. Облачные AI API отключены.')
