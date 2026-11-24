@@ -569,6 +569,8 @@ class MainWindow(QMainWindow):
         self.speaker_crop.setChecked(True); ff.addRow(self.speaker_crop)
         self.soft_follow = Switch('Мягкое слежение за лицом: увеличенное видео плавно сдвигается за лицом, чтобы его не обрезало')
         self.soft_follow.setChecked(True); ff.addRow(self.soft_follow)
+        self.scene_analysis = Switch('Анализ сцен: ролики заканчиваются на смене сцены или конце разговора, паузы с действием остаются, заставки вырезаются')
+        self.scene_analysis.setChecked(True); ff.addRow(self.scene_analysis)
         lay.addWidget(frame)
         subs = QGroupBox('Субтитры'); sf = QFormLayout(subs)
         self.sub_preset = QComboBox(); self.sub_preset.addItems(list(SUB_PRESETS)); self.sub_preset.currentTextChanged.connect(self.apply_preset); sf.addRow('Стиль', self.sub_preset)
@@ -729,6 +731,7 @@ class MainWindow(QMainWindow):
                 'background': 'black' if self.background.currentIndex() == 1 else 'blur',
                 'hook': self.hook.isChecked(), 'punch_ins': self.punch.isChecked(), 'srt': self.srt.isChecked(),
                 'speaker_crop': self.speaker_crop.isChecked(), 'soft_follow': self.soft_follow.isChecked(),
+                'scene_analysis': self.scene_analysis.isChecked(),
                 'fill_clips': self.fill_clips.currentIndex() == 0, 'save_txt': self.save_txt.isChecked(),
                 'ai_descriptions': self.ai_desc.isChecked(), 'manual_pick': self.manual_pick.isChecked(),
                 'subtitle_style': self.subtitle_style()}
@@ -752,7 +755,7 @@ class MainWindow(QMainWindow):
             if isinstance(ui.get(key), int): widget.setCurrentIndex(ui[key])
         for key, widget in (('manual_pick', self.manual_pick), ('ai_desc', self.ai_desc), ('hook', self.hook),
                             ('punch', self.punch), ('srt', self.srt), ('speaker_crop', self.speaker_crop),
-                            ('soft_follow', self.soft_follow), ('save_txt', self.save_txt)):
+                            ('soft_follow', self.soft_follow), ('save_txt', self.save_txt), ('scene_analysis', self.scene_analysis)):
             if key in ui: widget.setChecked(bool(ui[key]))
         st = ui.get('subtitles') or {}
         if st.get('preset') in SUB_PRESETS: self.sub_preset.setCurrentText(st['preset'])
@@ -803,6 +806,7 @@ class MainWindow(QMainWindow):
                     'manual_pick': self.manual_pick.isChecked(), 'ai_desc': self.ai_desc.isChecked(), 'hook': self.hook.isChecked(),
                     'punch': self.punch.isChecked(), 'srt': self.srt.isChecked(), 'subtitles': self.subtitle_style(),
                     'speaker_crop': self.speaker_crop.isChecked(), 'soft_follow': self.soft_follow.isChecked(),
+                    'scene_analysis': self.scene_analysis.isChecked(),
                     'preview_speaker': self.design_preview.speaker.isChecked(),
                     'out_dir': self.out_edit.text().strip(), 'banner': self.banner}}
         # Write to a temp file and swap: a crash mid-write can never leave a broken settings file.
@@ -1020,7 +1024,8 @@ class MainWindow(QMainWindow):
     def _start_render(self, clips: list[dict]):
         if not clips: self._next_video(); return
         p = self.analysis
-        self._run(RenderWorker(p['source'], self.banner, p['out_dir'], self.run_settings, clips, p['words']), self.on_rendered, self.on_failed)
+        self._run(RenderWorker(p['source'], self.banner, p['out_dir'], self.run_settings, clips, p['words'], p.get('scenes')),
+                  self.on_rendered, self.on_failed)
 
     def on_rendered(self, results: list, msg: str):
         start = len(self.results)

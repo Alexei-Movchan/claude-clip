@@ -230,7 +230,7 @@ def transcribe(path: str, model_size: str = 'small', device: str = 'auto', progr
         else:
             threads = max(4, (os.cpu_count() or 8) // 2)  # ≈ physical cores; default is only 4
             model = WhisperModel(model_size, device='cpu', compute_type='int8', cpu_threads=threads)
-            beam, batch = 2, 4
+            beam, batch = 5, 4   # quality first: full beam search on the CPU too
         kwargs = dict(language='ru', word_timestamps=True, vad_filter=True, beam_size=beam,
                       vad_parameters={'min_silence_duration_ms': 500})
         try:
@@ -278,6 +278,87 @@ def transcribe(path: str, model_size: str = 'small', device: str = 'auto', progr
     return _run('cpu')
 
 
+# --------------------------------------------------------------------------- scenes (what happens in the picture)
+
+SCENE_FPS = 4          # samples per second (quality over speed)
+SCENE_CUT = 0.15       # scene_score above this = a cut to another shot
+ACTION_X = 4.0         # a pause is "action" when it moves 4× more than this video usually does
+ACTION_MIN = 0.0008    # …and at least this much (scene_score units)
+
+
+def analyze_scenes(source: str, cache_path: str | None = None, progress: Callable[[float], None] | None = None) -> dict:
+    """One pass over the video at 2 fps, 160 px: scene-change score and brightness per sample.
+
+    Used to end clips where a scene ends, to keep pauses with action and to cut title cards.
+    Cached next to the transcript; uses the GPU decoder when available.
+    """
+    st = os.stat(source)
+    key = {'source': os.path.abspath(source), 'size': st.st_size, 'mtime': int(st.st_mtime), 'v': 2, 'fps': SCENE_FPS}
+    if cache_path and Path(cache_path).exists():
+        try:
+            data = json.loads(Path(cache_path).read_text(encoding='utf-8'))
+            if data.get('key') == key: return data
+        except Exception:
+            pass
+    duration = probe(source)['duration']
+    with tempfile.TemporaryDirectory(prefix='cloudy_scn_') as td:
+        meta = os.path.join(td, 'meta.txt')
+        vf = (f"fps={SCENE_FPS},scale=240:-2,signalstats,select='gte(scene\\,0)',"
+              f"metadata=print:file='{_ffmpeg_filter_path(meta)}'")
+        base = [ffmpeg_path(), '-hide_banner', '-y']
+        tail = ['-i', source, '-an', '-sn', '-vf', vf, '-f', 'null', '-']
+        try:
+            run_progress(base + ['-hwaccel', 'auto'] + tail, duration, progress)
+        except RuntimeError:
+            run_progress(base + tail, duration, progress)    # no hardware decoder: plain CPU decode
+        score, luma = [], []
+        for line in Path(meta).read_text(encoding='utf-8', errors='replace').splitlines():
+            if line.startswith('frame:'):
+                score.append(0.0); luma.append(0.0)
+            elif line.startswith('lavfi.scene_score=') and score:
+                score[-1] = float(line.split('=', 1)[1])
+            elif line.startswith('lavfi.signalstats.YAVG=') and luma:
+                luma[-1] = float(line.split('=', 1)[1])
+    data = {'key': key, 'fps': SCENE_FPS, 'score': [round(x, 4) for x in score], 'luma': [round(x, 1) for x in luma]}
+    if cache_path:
+        try: Path(cache_path).write_text(json.dumps(data), encoding='utf-8')
+        except OSError: pass
+    return data
+
+
+def _scene_slice(scenes: dict | None, a: float, b: float) -> tuple[list[float], list[float]]:
+    if not scenes or not scenes.get('score'): return [], []
+    f = scenes.get('fps', SCENE_FPS)
+    i, j = max(0, int(a * f)), max(0, int(b * f) + 1)
+    return scenes['score'][i:j], scenes['luma'][i:j]
+
+
+def _baseline(scenes: dict) -> float:
+    """Typical frame-to-frame change of this video (median), cached in the dict."""
+    if '_base' not in scenes:
+        sc = sorted(scenes.get('score') or [0.0])
+        scenes['_base'] = sc[len(sc) // 2]
+    return scenes['_base']
+
+
+def scene_cut_between(scenes: dict | None, a: float, b: float) -> bool:
+    sc, _ = _scene_slice(scenes, a, b)
+    return any(x > SCENE_CUT for x in sc)
+
+
+def pause_kind(scenes: dict | None, a: float, b: float) -> str:
+    """'title' (mostly dark and still: a title card / black), 'action' (movement or a cut inside),
+    'still' or 'unknown'. The first/last half second is ignored: entering a title card is a cut too."""
+    sc, lu = _scene_slice(scenes, a + 0.5, b - 0.5)
+    if not sc: return 'unknown'
+    moving = sum(sc) / len(sc)
+    dark = sum(1 for x in lu if x < 45) / max(1, len(lu))
+    act = max(ACTION_MIN, ACTION_X * _baseline(scenes))
+    if dark >= 0.6 and moving < act: return 'title'
+    if moving >= act or any(x > SCENE_CUT for x in sc): return 'action'
+    return 'still'
+
+
 # --------------------------------------------------------------------------- sentences & clip selection
 
 _SENT_END = ('.', '!', '?', '…')
@@ -320,6 +401,41 @@ def clip_length(sents: list[dict], s: int, e: int) -> float:
     return (sents[e]['end'] - sents[s]['start']) - (sents[e]['cum'] - sents[s]['cum'])
 
 
+def annotate_boundaries(sents: list[dict], scenes: dict | None = None) -> list[dict]:
+    """How good a place it is to END a clip after each phrase (b_after): a long pause, a finished
+    sentence and a scene change make a strong border; a question (an answer follows) a weak one."""
+    for k, s in enumerate(sents):
+        nxt = sents[k + 1]['start'] if k + 1 < len(sents) else s['end'] + 8
+        gap = nxt - s['end']
+        text = s['text'].rstrip()
+        b = min(gap, 8.0) / 2.0
+        if text.endswith(('.', '!', '…')): b += 1.5
+        if text.endswith('?'): b -= 1.0
+        s['cut_after'] = bool(scenes) and scene_cut_between(scenes, s['end'] - 0.3, nxt + 0.3)
+        if s['cut_after']: b += 3.0
+        s['gap_after'] = gap; s['b_after'] = b
+    return sents
+
+
+def _b_before(sents: list[dict], k: int) -> float:
+    return 5.0 if k == 0 else sents[k - 1].get('b_after', 0.0)
+
+
+def refine_borders(sents: list[dict], s: int, e: int, tmin: float, tmax: float, reach: int = 6) -> tuple[int, int]:
+    """Move start/end a few phrases to the strongest borders (end of a conversation, scene change)
+    while keeping the played length inside [tmin, tmax]."""
+    best, best_score = (s, e), _b_before(sents, s) + sents[e].get('b_after', 0.0)
+    for s2 in range(max(0, s - reach), min(len(sents), s + reach + 1)):
+        e2 = s2
+        while e2 < len(sents) and clip_length(sents, s2, e2) < tmin: e2 += 1
+        while e2 < len(sents) and clip_length(sents, s2, e2) <= tmax:
+            if sents[e2]['end'] - sents[s2]['start'] <= tmax * WALL_LIMIT:
+                sc = _b_before(sents, s2) + sents[e2].get('b_after', 0.0) - 0.08 * (abs(s2 - s) + abs(e2 - e))
+                if sc > best_score + 1e-6: best, best_score = (s2, e2), sc
+            e2 += 1
+    return best
+
+
 def fit_to_sentences(sents: list[dict], s: int, e: int, tmin: float, tmax: float) -> tuple[int, int] | None:
     """Move clip borders by whole phrases until the duration fits [tmin, tmax]."""
     s = max(0, min(s, len(sents) - 1)); e = max(s, min(e, len(sents) - 1))
@@ -360,7 +476,7 @@ def _dedupe(clips: list[dict], max_overlap: float) -> list[dict]:
 
 
 def fallback_clips(words: list[dict], target_min: float = 90, target_max: float = 150,
-                   taken: list[tuple[float, float]] | None = None) -> list[dict]:
+                   taken: list[tuple[float, float]] | None = None, scenes: dict | None = None) -> list[dict]:
     """Offline selection packed as tightly as possible.
 
     Candidate windows start and end on phrase borders; then weighted interval scheduling picks
@@ -368,7 +484,7 @@ def fallback_clips(words: list[dict], target_min: float = 90, target_max: float 
     ranges already used by AI-picked clips, which candidates must not overlap.
     """
     import bisect
-    sents = build_sentences(words)
+    sents = annotate_boundaries(build_sentences(words), scenes)
     if not sents: return []
     taken = taken or []
     goals = sorted({target_min + 8, (target_min + target_max) / 2})
@@ -380,13 +496,16 @@ def fallback_clips(words: list[dict], target_min: float = 90, target_max: float 
             j = i
             while j + 1 < len(sents) and clip_length(sents, i, j + 1) <= goal: j += 1
             fit = fit_to_sentences(sents, i, j, target_min, target_max)
+            if fit: fit = refine_borders(sents, fit[0], fit[1], target_min, target_max, reach=0 if goal == goals[0] else 3)
             if not fit or fit in seen: continue
             seen.add(fit); a, b = fit
             st, en = sents[a]['start'], sents[b]['end']
             if any(min(en, y) - max(st, x) > 0.5 for x, y in taken): continue
             text = ' '.join(x['text'] for x in sents[a:b + 1])
-            score = _candidate_score(text) + (5 if sents[b]['text'].endswith(_SENT_END) else 0)
+            borders = _b_before(sents, a) + sents[b]['b_after']
+            score = _candidate_score(text)
             candidates.append({'start': st, 'end': en, 'title': '', 'hook': '', 'score': round(min(100, score), 1),
+                               'weight': 100 + score + 25 * borders,   # quality first: whole stories beat one more clip
                                'reason': 'Автоматический подбор по фразам, паузам и текстовым сигналам', 'transcript': text})
     if not candidates: return []
     candidates.sort(key=lambda c: c['end'])
@@ -394,7 +513,7 @@ def fallback_clips(words: list[dict], target_min: float = 90, target_max: float 
     best = [(0.0, [])]  # best[k] = (weight, chosen indices) using the first k candidates
     for k, c in enumerate(candidates):
         p = bisect.bisect_right(ends, c['start'] + 0.05, 0, k)   # candidates that end before this one starts
-        take = (best[p][0] + 1000 + c['score'], best[p][1] + [k])  # count first, then text score
+        take = (best[p][0] + c['weight'], best[p][1] + [k])
         best.append(take if take[0] > best[k][0] else best[k])
     result = [candidates[k] for k in best[-1][1]]
     for n, c in enumerate(result, 1): c['title'] = f'Нарезка {n}'
@@ -566,7 +685,7 @@ def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: s
               target_min: int = 90, target_max: int = 150, use_local_ai: bool = True,
               notice_callback: Callable[[str], None] | None = None,
               cancel: Callable[[], bool] | None = None, fill: bool = True,
-              debug_dir: str | None = None) -> list[dict]:
+              debug_dir: str | None = None, scenes: dict | None = None) -> list[dict]:
     """Local-first highlight selection; deterministic offline fallback if Ollama is unavailable.
 
     The model sees numbered phrases and answers with phrase numbers, not seconds,
@@ -576,13 +695,22 @@ def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: s
     """
     if not words: return []
     if not use_local_ai:
-        return fallback_clips(words, target_min, target_max)
-    sents = build_sentences(words)
+        return fallback_clips(words, target_min, target_max, scenes=scenes)
+    sents = annotate_boundaries(build_sentences(words), scenes)
     errors, chosen, log = [], [], []
     chunks = _sentence_chunks(sents, max_tokens=4500, overlap_seconds=target_max * 0.6)
 
     def ask(chunk, n, want_min, exclude):
-        lines = '\n'.join(f"{s['id']}. [{s['start']:.1f}-{s['end']:.1f}] {s['text']}" for s in chunk)
+        out_lines = []
+        for k, s_ in enumerate(chunk):
+            if k:   # show the model where the video pauses or cuts to another scene: natural story borders
+                prev = chunk[k - 1]
+                marks = []
+                if prev['gap_after'] >= 2.5: marks.append(f"пауза {prev['gap_after']:.0f} с")
+                if prev.get('cut_after'): marks.append('смена сцены')
+                if marks: out_lines.append('— ' + ', '.join(marks) + ' —')
+            out_lines.append(f"{s_['id']}. [{s_['start']:.1f}-{s_['end']:.1f}] {s_['text']}")
+        lines = '\n'.join(out_lines)
         avg = max(1.0, (chunk[-1]['end'] - chunk[0]['start']) / max(1, len(chunk)))
         p_lo, p_hi = max(3, int(target_min / avg)), max(4, int(target_max / avg))
         excl = ''
@@ -594,7 +722,9 @@ def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: s
             f'Выбери от {want_min} до 6 хороших самостоятельных фрагментов для TikTok/Shorts из разных мест этой расшифровки.\n'
             f'Каждый фрагмент — непрерывный диапазон фраз от start_id до end_id длительностью от {target_min} до {target_max} секунд: '
             f'это примерно {p_lo}–{p_hi} фраз подряд. Используй номера фраз точно как в списке (от {chunk[0]["id"]} до {chunk[-1]["id"]}).\n'
-            'Фрагмент начинается с начала мысли, заканчивается законченной мыслью и понятен без остального видео. '
+            'Строки «— пауза … —» и «— смена сцены —» без номеров — это паузы и смены сцен в видео. '
+            'Фрагмент — законченная история или разговор целиком: начинай с начала разговора, заканчивай там, где он '
+            'заканчивается (обычно перед длинной паузой или сменой сцены). НЕ обрывай фрагмент посреди диалога. '
             'Ищи истории, юмор, эмоции, неожиданные повороты, сильные мысли, интригу. Фрагменты не пересекаются.\n' + excl +
             'Верни JSON: {"clips": [{"start_id": 0, "end_id": 0, "title": "короткое название", '
             '"hook": "дословная цепляющая фраза", "score": 1-100, "reason": "почему интересно"}]}\n'
@@ -637,7 +767,7 @@ def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: s
             for s_id, e_id, c in ranges:
                 fit = fit_centered(sents, s_id, e_id, target_min, target_max)
                 if not fit: nofit += 1; continue
-                a, b = fit
+                a, b = refine_borders(sents, fit[0], fit[1], target_min, target_max)
                 cand = {'start': sents[a]['start'], 'end': sents[b]['end']}
                 hits = [x for x in chosen if _overlap_ratio(cand, x) >= 0.3]
                 if hits:   # try the free space right after the clip(s) it runs into
@@ -666,12 +796,12 @@ def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: s
     unique = sorted(chosen, key=lambda c: c['start'])
     if unique:
         if fill:  # "as many as possible": add non-overlapping offline windows from the rest of the video
-            extra = fallback_clips(words, target_min, target_max, taken=[(c['start'], c['end']) for c in unique])
+            extra = fallback_clips(words, target_min, target_max, taken=[(c['start'], c['end']) for c in unique], scenes=scenes)
             for c in extra:
                 c['reason'] = 'Добор: ' + c['reason'][0].lower() + c['reason'][1:]; c['title'] = ''
             unique = sorted(unique + extra, key=lambda c: c['start'])
         return unique
-    clips = fallback_clips(words, target_min, target_max)
+    clips = fallback_clips(words, target_min, target_max, scenes=scenes)
     why = '; '.join(errors) if errors else 'модель не вернула подходящих фрагментов'
     for c in clips: c['reason'] = 'Офлайн-резерв (AI не сработал: ' + why[:150] + ')'
     return clips
@@ -709,12 +839,18 @@ def ai_metadata(transcript: str, base_url: str = 'http://127.0.0.1:11434', model
 
 # --------------------------------------------------------------------------- render helpers
 
+ACTION_KEEP = 2.5      # seconds of a silent-but-moving moment that stay in the clip
+
+
 def plan_keep_ranges(words: list[dict], clip_start: float, clip_end: float, keep_pause: float = 0.5,
-                     cut_threshold: float = 1.2, min_duration: float = 90.0) -> list[tuple[float, float]]:
+                     cut_threshold: float = 1.2, min_duration: float = 90.0,
+                     scenes: dict | None = None) -> list[tuple[float, float]]:
     """Ranges (relative to clip start) that stay after shortening long pauses.
 
     Each long gap keeps `keep_pause` seconds of air (half on each side) so word
-    endings that Whisper times too early are not chopped off.
+    endings that Whisper times too early are not chopped off. With scene data, a pause
+    in which something happens on screen (movement, a cut) keeps up to ACTION_KEEP seconds;
+    still pauses and dark title cards are cut.
     """
     duration = max(0.0, clip_end - clip_start)
     local = sorted((max(0.0, float(w['start']) - clip_start), min(duration, float(w['end']) - clip_start))
@@ -723,6 +859,9 @@ def plan_keep_ranges(words: list[dict], clip_start: float, clip_end: float, keep
     for (_, prev_end), (next_start, _) in zip(local, local[1:]):
         if next_start - prev_end > cut_threshold:
             left, right = prev_end + keep_pause / 2, next_start - keep_pause / 2
+            if scenes and pause_kind(scenes, clip_start + prev_end, clip_start + next_start) == 'action':
+                if next_start - prev_end <= ACTION_KEEP + keep_pause: continue   # short action: keep it whole
+                left = prev_end + ACTION_KEEP                                     # keep the first seconds of action
             if right - left > 0.25: cuts.append((left, right))
     merged: list[tuple[float, float]] = []
     for a, b in cuts:
@@ -797,9 +936,9 @@ def encoder_name() -> str:
 
 def _vcodec(quality: int) -> tuple[list[str], bool]:
     if _ENC['pref'] != 'cpu' and nvenc_available():
-        return ['-c:v', 'h264_nvenc', '-preset', 'p5', '-tune', 'hq', '-rc', 'vbr', '-cq', str(quality),
+        return ['-c:v', 'h264_nvenc', '-preset', 'p7', '-tune', 'hq', '-rc', 'vbr', '-multipass', 'fullres', '-cq', str(quality),
                 '-b:v', '0', '-pix_fmt', 'yuv420p'], True
-    return ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', str(quality), '-pix_fmt', 'yuv420p'], False
+    return ['-c:v', 'libx264', '-preset', 'medium', '-crf', str(quality), '-pix_fmt', 'yuv420p'], False
 
 
 def run_progress(cmd: list[str], duration: float, callback: Callable[[float], None] | None) -> None:
@@ -1076,7 +1215,7 @@ def _assemble(base: str, banner: str, banner_info: dict, out: str, base_dur: flo
     graph.append(f"{''.join(labels)}concat=n={len(labels)}:v=1:a=1[vc][ac]")
     graph.append(f"[vc]ass='{_ffmpeg_filter_path(ass_path)}',format=yuv420p[v]")
     _encode([ffmpeg_path(), '-y', *args, '-filter_complex', ';'.join(graph), '-map', '[v]', '-map', '[ac]'],
-            ['-r', str(FPS), '-c:a', 'aac', '-b:a', '192k', '-ar', str(SAMPLE_RATE), '-ac', '2', '-movflags', '+faststart', out], 19,
+            ['-r', str(FPS), '-c:a', 'aac', '-b:a', '256k', '-ar', str(SAMPLE_RATE), '-ac', '2', '-movflags', '+faststart', out], 18,
             (hook[1] if hook else 0.0) + base_dur + len(positions) * ad_dur, progress)
     area = (sw * sh) / (OUT_W * OUT_H)
     return {'visible_area_ratio': area, 'scaled_width': sw, 'scaled_height': sh, 'preserved_aspect_ratio': True,
@@ -1098,7 +1237,7 @@ def render_clip(source: str, banner: str, clip: dict, words: list[dict], output:
     banner_info = probe(banner)
     speed = max(1.0, min(1.3, float(speed)))
     with tempfile.TemporaryDirectory(prefix='cloudy_') as td:
-        keep = plan_keep_ranges(words, start, end)
+        keep = plan_keep_ranges(words, start, end, scenes=opt.get('scenes'))
         mapper, base_dur = make_mapper(keep)
         clip_words = [w for w in words if float(w['end']) > start and float(w['start']) < end]
         word_times = [(mapper(float(w['start']) - start), mapper(float(w['end']) - start)) for w in clip_words]

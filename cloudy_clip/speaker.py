@@ -60,7 +60,7 @@ def _make_detector(cv2, width: int, height: int, scale: float):
 
 
 def analyze_active_speaker(path: str, clip_start: float, clip_end: float,
-                           words: list[dict], sample_fps: float = 4.0, progress=None) -> dict[str, Any]:
+                           words: list[dict], sample_fps: float = 6.0, progress=None) -> dict[str, Any]:
     """Return crop-center keyframes [(t relative to clip start, x in source pixels)].
 
     Empty keyframes → the caller keeps the safe letterbox framing.

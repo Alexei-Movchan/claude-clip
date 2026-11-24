@@ -3,7 +3,7 @@ import json, os, time, traceback
 from pathlib import Path
 from PySide6.QtCore import QObject, Signal, Slot
 from .media import (probe, transcribe, ai_select, ai_metadata, render_clip, safe_name, scan_render_quality,
-                    set_encoder, HOOK_MAX)
+                    set_encoder, analyze_scenes, HOOK_MAX)
 from .speaker import analyze_active_speaker, soft_follow_keyframes
 
 AD_LINE = 'Лучший VPN с обходом 👇 Ищи в Telegram: @cloudy\n#cloudyvpn'
@@ -120,6 +120,16 @@ class AnalyzeWorker(QObject):
             (data_dir_for(self.out_dir) / 'transcript.txt').write_text(transcript, encoding='utf-8')
             if self._cancel: raise RuntimeError('Обработка остановлена')
             self.eta.emit(-1.0)
+            scenes = None
+            if self.settings.get('scene_analysis', True):
+                self.progress.emit(35, 'Анализ сцен: смены кадров, движение, заставки')
+                try:
+                    scenes = analyze_scenes(self.source, str(data_dir_for(self.out_dir) / 'scenes.json'),
+                                            progress=lambda f: self.progress.emit(35 + int(3 * f), f'Анализ сцен: {int(f * 100)}%'))
+                except Exception as e:
+                    self.progress.emit(38, f'Анализ сцен не удался ({str(e)[:80]}) — продолжаю без него')
+                    scenes = None
+                if self._cancel: raise RuntimeError('Обработка остановлена')
             self.progress.emit(38, 'Поиск лучших моментов (локальный AI)')
             ad_duration = banner_info['duration']
             target_max = target_max_seconds(ad_duration, self.settings.get('hook', True))
@@ -130,7 +140,7 @@ class AnalyzeWorker(QObject):
                               model=self.settings.get('local_model', 'qwen3:4b'), target_min=90, target_max=target_max,
                               use_local_ai=True, notice_callback=lambda msg: self.progress.emit(40, msg),
                               cancel=lambda: self._cancel, fill=self.settings.get('fill_clips', True),
-                              debug_dir=str(data_dir_for(self.out_dir)))
+                              debug_dir=str(data_dir_for(self.out_dir)), scenes=scenes)
             if not clips: raise RuntimeError('Не удалось найти фрагменты нужной продолжительности. Попробуйте более длинное видео.')
             # Trim long silent openings/endings when enough speech remains.
             speech_clips = []
@@ -145,7 +155,7 @@ class AnalyzeWorker(QObject):
             clips = sorted(speech_clips or clips, key=lambda c: c.get('score', 0), reverse=True)
             self.progress.emit(50, f'Найдено моментов: {len(clips)}')
             self.finished.emit({'source': self.source, 'out_dir': self.out_dir, 'words': words,
-                                'transcript': transcript, 'clips': clips})
+                                'transcript': transcript, 'clips': clips, 'scenes': scenes})
         except Exception as e:
             self.failed.emit(f'{e}\n\nПодробности:\n{traceback.format_exc()}')
 
@@ -157,9 +167,10 @@ class RenderWorker(QObject):
     finished = Signal(list, str)
     failed = Signal(str)
 
-    def __init__(self, source: str, banner: str, out_dir: str, settings: dict, clips: list[dict], words: list[dict]):
+    def __init__(self, source: str, banner: str, out_dir: str, settings: dict, clips: list[dict], words: list[dict],
+                 scenes: dict | None = None):
         super().__init__(); self.source = source; self.banner = banner; self.out_dir = out_dir
-        self.settings = settings; self.clips = clips; self.words = words
+        self.settings = settings; self.clips = clips; self.words = words; self.scenes = scenes
         self._cancel = False
 
     def cancel(self): self._cancel = True
@@ -173,7 +184,7 @@ class RenderWorker(QObject):
             url = self.settings.get('ollama_url', 'http://127.0.0.1:11434'); model = self.settings.get('local_model', 'qwen3:4b')
             options = {'background': self.settings.get('background', 'blur'), 'hook': self.settings.get('hook', True),
                        'punch_ins': self.settings.get('punch_ins', True), 'srt': self.settings.get('srt', True),
-                       'subtitle_style': self.settings.get('subtitle_style')}
+                       'subtitle_style': self.settings.get('subtitle_style'), 'scenes': self.scenes}
             results = []
             n = len(clips)
             first_no = next_clip_number(self.out_dir)
