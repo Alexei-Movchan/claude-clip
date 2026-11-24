@@ -338,26 +338,67 @@ def _extract_clip_list(parsed: Any) -> list:
     return []
 
 
-def _ollama_chat(base_url: str, model: str, prompt: str, num_ctx: int = 16384) -> str:
-    """Call only a loopback Ollama endpoint; no transcript leaves this PC."""
+class Cancelled(RuntimeError):
+    pass
+
+
+def _json_complete(text: str) -> bool:
+    t = _strip_model_output(text)
+    if not t or t[-1] not in '}]': return False
+    try:
+        json.loads(t); return True
+    except ValueError:
+        return False
+
+
+def _ollama_chat(base_url: str, model: str, prompt: str, num_ctx: int = 16384, max_tokens: int = 3000,
+                 max_seconds: float = 300.0, on_tokens: Callable[[int], None] | None = None,
+                 cancel: Callable[[], bool] | None = None) -> str:
+    """Call only a loopback Ollama endpoint; no transcript leaves this PC.
+
+    Streams the answer so that it can be watched, cancelled and cut short: in JSON mode
+    small models sometimes finish the JSON and then keep emitting whitespace forever.
+    """
     from urllib.parse import urlparse
+    import time as _time
     parsed = urlparse(base_url)
     if parsed.scheme not in ('http', 'https') or parsed.hostname not in ('127.0.0.1', 'localhost', '::1'):
         raise RuntimeError('Разрешён только локальный Ollama: http://127.0.0.1:11434')
-    payload = json.dumps({'model': model, 'stream': False, 'format': 'json', 'think': False,
-        'options': {'temperature': 0.2, 'num_ctx': num_ctx},
+    payload = json.dumps({'model': model, 'stream': True, 'format': 'json', 'think': False,
+        'options': {'temperature': 0.2, 'num_ctx': num_ctx, 'num_predict': max_tokens},
         'messages': [
             {'role': 'system', 'content': 'Ты редактор коротких видео. Анализируй только данную расшифровку. Не выдумывай цитаты и события. Отвечай только JSON.'},
             {'role': 'user', 'content': prompt}
         ]}).encode('utf-8')
     req = urllib.request.Request(base_url.rstrip('/') + '/api/chat', data=payload,
         headers={'Content-Type': 'application/json'}, method='POST')
+    parts: list[str] = []
+    started = _time.monotonic(); count = 0
     try:
-        with urllib.request.urlopen(req, timeout=900) as response:
-            data = json.loads(response.read().decode('utf-8'))
+        # timeout = max wait for the NEXT piece (the first one includes loading the model)
+        with urllib.request.urlopen(req, timeout=180) as response:
+            for line in response:
+                if cancel and cancel(): raise Cancelled('Остановлено пользователем')
+                line = line.strip()
+                if not line: continue
+                data = json.loads(line.decode('utf-8'))
+                if data.get('error'): raise RuntimeError(f"Ollama: {data['error']}")
+                piece = data.get('message', {}).get('content', '')
+                if piece:
+                    parts.append(piece); count += 1
+                    if on_tokens and count % 25 == 0: on_tokens(count)
+                    if ('}' in piece or ']' in piece) and _json_complete(''.join(parts)):
+                        break  # the answer is complete — do not wait for trailing whitespace
+                if data.get('done'): break
+                if _time.monotonic() - started > max_seconds:
+                    if _json_complete(''.join(parts)): break
+                    limit = f'{int(max_seconds // 60)} мин' if max_seconds >= 60 else f'{int(max_seconds)} с'
+                    raise RuntimeError(f'модель отвечала дольше {limit}')
     except urllib.error.URLError as exc:
         raise RuntimeError('Ollama не запущен. Установите Ollama и выполните: ollama pull qwen3:4b') from exc
-    return data.get('message', {}).get('content', '')
+    except TimeoutError as exc:
+        raise RuntimeError('Ollama не отвечает') from exc
+    return ''.join(parts)
 
 
 def _sentence_chunks(sents: list[dict], max_tokens: int, overlap_seconds: float) -> list[list[dict]]:
@@ -377,7 +418,8 @@ def _sentence_chunks(sents: list[dict], max_tokens: int, overlap_seconds: float)
 
 def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: str = 'http://127.0.0.1:11434', model: str = 'qwen3:4b',
               target_min: int = 90, target_max: int = 150, use_local_ai: bool = True,
-              notice_callback: Callable[[str], None] | None = None) -> list[dict]:
+              notice_callback: Callable[[str], None] | None = None,
+              cancel: Callable[[], bool] | None = None) -> list[dict]:
     """Local-first highlight selection; deterministic offline fallback if Ollama is unavailable.
 
     The model sees numbered phrases and answers with phrase numbers, not seconds,
@@ -402,8 +444,12 @@ def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: s
             '"hook": "дословная цепляющая фраза из фрагмента", "score": 1-100, "reason": "почему это интересно"}]}\n\n'
             'Фразы:\n' + lines)
         try:
-            raw = _strip_model_output(_ollama_chat(base_url, model, prompt))
+            tokens_note = (lambda k, n=n: notice_callback(f'Локальный AI: часть {n}/{len(chunks)} · ответ модели: {k} токенов')) \
+                if notice_callback else None
+            raw = _strip_model_output(_ollama_chat(base_url, model, prompt, on_tokens=tokens_note, cancel=cancel))
             items = _extract_clip_list(json.loads(raw))
+        except Cancelled:
+            raise
         except Exception as exc:
             errors.append(str(exc)[:150])
             if isinstance(exc, RuntimeError) and 'Ollama не запущен' in str(exc): break
@@ -446,7 +492,8 @@ def ai_metadata(transcript: str, base_url: str = 'http://127.0.0.1:11434', model
               'Верни JSON: {"title": "...", "description": "...", "hashtags": ["#...", "#..."], "hook": "..."}\n\n'
               'Расшифровка:\n' + text)
     try:
-        data = json.loads(_strip_model_output(_ollama_chat(base_url, model, prompt, num_ctx=8192)))
+        data = json.loads(_strip_model_output(_ollama_chat(base_url, model, prompt, num_ctx=8192, max_tokens=800,
+                                                           max_seconds=120)))
     except Exception:
         return None
     if not isinstance(data, dict): return None
