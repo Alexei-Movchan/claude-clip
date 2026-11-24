@@ -1,0 +1,655 @@
+from __future__ import annotations
+import json, os, sys, time
+from pathlib import Path
+from PySide6.QtCore import QThread, Qt, QUrl, QTimer, QObject, Signal, Slot
+from PySide6.QtGui import QDesktopServices, QFont, QIcon
+from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+    QPushButton, QLineEdit, QFileDialog, QProgressBar, QListWidget, QListWidgetItem, QMessageBox,
+    QTabWidget, QFormLayout, QComboBox, QGroupBox, QTextEdit, QSplitter, QCheckBox, QSpinBox, QFontComboBox,
+    QScrollArea, QFrame, QSystemTrayIcon, QStyle, QProgressDialog)
+from .pipeline import AnalyzeWorker, RenderWorker, output_dir_for
+from .media import ffmpeg_available, probe, SUB_PRESETS, SUB_POSITIONS, ACTIVE_COLORS
+from .updater import (APP_VERSION, DEFAULT_OWNER, DEFAULT_REPO, check_release, download_and_stage, is_newer,
+                      UpdateError)
+
+STYLE = '''
+QMainWindow,QWidget { background:#10131b; color:#eef1f8; font-family:Segoe UI; font-size:10pt; }
+QLabel#hero {font-size:20pt;font-weight:700;color:#ffffff;}
+QLabel#eta {color:#c9bfff;font-weight:600;}
+QScrollArea {border:0;background:transparent;}
+QFrame#bottom {background:#141a26;border:1px solid #293244;border-radius:12px;}
+QLabel#muted {color:#9aa5b5;}
+QGroupBox {border:1px solid #293244;border-radius:12px;margin-top:12px;padding:14px;font-weight:600;}
+QGroupBox::title {subcontrol-origin:margin;left:12px;padding:0 5px;color:#a9b8ce;}
+QLineEdit,QComboBox,QTextEdit,QListWidget,QSpinBox,QFontComboBox {background:#171d29;border:1px solid #303b50;border-radius:8px;padding:7px;color:#f4f6fb;}
+QPushButton {background:#27344a;border:0;border-radius:9px;padding:10px 16px;color:white;font-weight:600;}
+QPushButton:hover {background:#344766;} QPushButton#primary {background:#6b55e8;} QPushButton#primary:hover {background:#806df2;}
+QPushButton:disabled {background:#1c2433;color:#6c7789;}
+QProgressBar {background:#1b2331;border:0;border-radius:7px;height:16px;text-align:center;color:white;}
+QProgressBar::chunk {background:#6b55e8;border-radius:7px;}
+QTabWidget::pane {border:1px solid #293244;border-radius:10px;} QTabBar::tab {background:#171d29;padding:10px 18px;border-radius:7px;margin:3px;} QTabBar::tab:selected {background:#394867;}
+QCheckBox::indicator, QListWidget::indicator {width:16px;height:16px;border:1px solid #5a6a86;border-radius:4px;background:#171d29;}
+QCheckBox::indicator:checked, QListWidget::indicator:checked {background:#6b55e8;border-color:#8b78ff;}
+QListWidget::item {padding:6px;} QListWidget::item:selected {background:#2c3a55;}
+'''
+
+ZOOM_ITEMS = ['100% — весь кадр', '115%', '130%', '150%', '175% — почти без полос']
+
+
+class UpdateCheckWorker(QObject):
+    found = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, owner: str, repo: str):
+        super().__init__(); self.owner, self.repo = owner, repo
+
+    @Slot()
+    def run(self):
+        try: self.found.emit(check_release(self.owner, self.repo))
+        except Exception as e: self.failed.emit(str(e))
+
+
+class UpdateDownloadWorker(QObject):
+    progress = Signal(int, int)
+    done = Signal()
+    failed = Signal(str)
+
+    def __init__(self, release: dict, install_dir: Path):
+        super().__init__(); self.release, self.install_dir = release, install_dir
+
+    @Slot()
+    def run(self):
+        try:
+            download_and_stage(self.release, self.install_dir, progress=lambda d, t: self.progress.emit(d, t))
+            self.done.emit()
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+def resource_path(relative: str) -> Path:
+    base = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parents[1]))
+    return base / relative
+
+
+VIDEO_EXT = ('.mp4', '.mov', '.mkv', '.avi', '.webm')
+
+
+def _human(sec: float) -> str:
+    sec = int(max(0, round(sec)))
+    if sec < 60: return f'{sec} с'
+    if sec < 3600: return f'{sec // 60} мин {sec % 60:02} с'
+    return f'{sec // 3600} ч {sec % 3600 // 60:02} мин'
+
+
+def _keep_awake(on: bool) -> None:
+    """Stop Windows from sleeping during long processing (the screen may still turn off)."""
+    if os.name != 'nt': return
+    try:
+        import ctypes
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0))
+    except Exception:
+        pass
+
+
+def _fmt(t: float) -> str:
+    t = int(round(t)); return f'{t // 3600}:{t % 3600 // 60:02}:{t % 60:02}' if t >= 3600 else f'{t // 60}:{t % 60:02}'
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__(); self.setWindowTitle('Cloudy Clip Studio'); self.resize(1180, 820)
+        bundled_banner = resource_path('assets/cloudy_banner.mp4')
+        self.banner = str(bundled_banner) if bundled_banner.exists() else ''
+        self.sources: list[str] = []
+        self.results: list[dict] = []
+        self.queue: list[str] = []; self.current_source = ''; self.current_out = ''; self.run_settings: dict = {}
+        self.analysis: dict | None = None
+        self._threads: list = []; self.worker = None; self._cancelled = False
+        self.setAcceptDrops(True)
+        icon = resource_path('assets/icon.ico')
+        self.setWindowIcon(QIcon(str(icon)) if icon.exists() else self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.auto_update = True; self.skip_version = ''; self.shortcut_offered = False; self._update_manual = False
+        root = QWidget(); self.setCentralWidget(root); outer = QVBoxLayout(root); outer.setContentsMargins(18, 12, 18, 12); outer.setSpacing(8)
+        head = QHBoxLayout(); title = QLabel('Cloudy Clip Studio'); title.setObjectName('hero'); head.addWidget(title)
+        sub = QLabel('  длинные записи → вертикальные ролики'); sub.setObjectName('muted'); head.addWidget(sub); head.addStretch()
+        badge = QLabel(f'{APP_VERSION} • локальная обработка'); badge.setObjectName('muted'); head.addWidget(badge); outer.addLayout(head)
+        self.tabs = QTabWidget(); outer.addWidget(self.tabs, 1)
+        self._build_project_tab(); self._build_design_tab(); self._build_select_tab(); self._build_results_tab(); self._build_settings_tab()
+        outer.addWidget(self._build_bottom_bar())
+        self.load_settings()
+        self.tray = QSystemTrayIcon(self.windowIcon(), self) if QSystemTrayIcon.isSystemTrayAvailable() else None
+        self._t_start = None; self._eta = -1.0; self._eta_at = 0.0
+        self.clock = QTimer(self); self.clock.timeout.connect(self._tick); self.clock.start(1000)
+        QTimer.singleShot(1500, self._offer_shortcut)
+        if self.auto_update: QTimer.singleShot(3000, lambda: self.check_for_updates(manual=False))
+
+    @staticmethod
+    def _gpu_status() -> str:
+        try:
+            from .gpu import cuda_device_count, gpu_libs_installed
+            n, libs = cuda_device_count(), gpu_libs_installed()
+        except Exception:
+            n, libs = 0, False
+        if n and libs: return '✓ Видеокарта NVIDIA готова: распознавание речи пойдёт на ней (быстро).'
+        if n: return ('⚠ Видеокарта NVIDIA есть, но библиотеки для неё не установлены — распознавание идёт на процессоре (медленно). '
+                      'Закройте программу и запустите enable_gpu.bat.')
+        return 'Видеокарта NVIDIA не найдена — распознавание на процессоре.'
+
+    @staticmethod
+    def _scroll(widget: QWidget) -> QScrollArea:
+        """Tabs scroll instead of squeezing fields when the window is shorter than the content."""
+        area = QScrollArea(); area.setWidgetResizable(True); area.setFrameShape(QFrame.NoFrame); area.setWidget(widget)
+        return area
+
+    def _build_bottom_bar(self) -> QWidget:
+        bar = QFrame(); bar.setObjectName('bottom'); bar.setMinimumHeight(92); v = QVBoxLayout(bar); v.setContentsMargins(14, 10, 14, 10); v.setSpacing(6)
+        row = QHBoxLayout()
+        self.start_btn = QPushButton('▶  Начать обработку'); self.start_btn.setObjectName('primary'); self.start_btn.clicked.connect(self.start_processing)
+        self.cancel_btn = QPushButton('Отменить'); self.cancel_btn.setEnabled(False); self.cancel_btn.clicked.connect(self.cancel_processing)
+        self.progress = QProgressBar(); self.progress.setValue(0)
+        row.addWidget(self.start_btn); row.addWidget(self.progress, 1); row.addWidget(self.cancel_btn); v.addLayout(row)
+        info = QHBoxLayout()
+        self.progress_label = QLabel('Готово к работе. Перетащите видео в окно или нажмите «Добавить видео».'); self.progress_label.setObjectName('muted')
+        self.queue_label = QLabel(''); self.queue_label.setObjectName('muted')
+        self.eta_label = QLabel(''); self.eta_label.setObjectName('eta')
+        info.addWidget(self.progress_label, 1); info.addWidget(self.queue_label); info.addSpacing(16); info.addWidget(self.eta_label); v.addLayout(info)
+        self.status = self.progress_label
+        return bar
+
+    # ------------------------------------------------------------------ tabs
+    def _build_project_tab(self):
+        tab = QWidget(); lay = QVBoxLayout(tab); lay.setSpacing(12)
+        files = QGroupBox('1. Исходные материалы'); fl = QVBoxLayout(files)
+        fl.addWidget(QLabel('Видео (можно несколько — обработаются по очереди). Файлы можно перетащить прямо в окно:'))
+        self.src_list = QListWidget(); self.src_list.setMinimumHeight(70); self.src_list.setMaximumHeight(130); fl.addWidget(self.src_list)
+        row = QHBoxLayout()
+        b = QPushButton('Добавить видео'); b.clicked.connect(self.pick_sources); row.addWidget(b)
+        b = QPushButton('Убрать выбранное'); b.clicked.connect(self.remove_source); row.addWidget(b)
+        b = QPushButton('Очистить'); b.clicked.connect(self.clear_sources); row.addWidget(b); row.addStretch(); fl.addLayout(row)
+        form = QFormLayout()
+        self.banner_edit = QLineEdit(self.banner); self.banner_edit.setReadOnly(True); br = QHBoxLayout(); br.addWidget(self.banner_edit, 1)
+        bb = QPushButton('Выбрать баннер'); bb.clicked.connect(self.pick_banner); br.addWidget(bb); form.addRow('Баннер CLOUDY', br)
+        self.out_edit = QLineEdit(str(Path.home() / 'Videos' / 'CloudyClipStudio')); orow = QHBoxLayout(); orow.addWidget(self.out_edit, 1)
+        ob = QPushButton('Папка'); ob.clicked.connect(self.pick_output); orow.addWidget(ob); form.addRow('Папка результата', orow)
+        fl.addLayout(form); lay.addWidget(files)
+
+        opts = QGroupBox('2. Обработка'); of = QFormLayout(opts)
+        self.whisper = QComboBox(); self.whisper.addItems(['small', 'medium', 'large-v3-turbo', 'large-v3']); self.whisper.setCurrentText('large-v3-turbo'); of.addRow('Модель распознавания', self.whisper)
+        model_note = QLabel('large-v3-turbo — лучший баланс. large-v3 точнее совсем чуть-чуть, но в несколько раз медленнее. '
+                            'small — самая быстрая, текст немного хуже.'); model_note.setWordWrap(True); model_note.setObjectName('muted'); of.addRow(model_note)
+        self.device = QComboBox(); self.device.addItems(['auto', 'cuda', 'cpu']); of.addRow('Устройство распознавания', self.device)
+        self.gpu_label = QLabel(self._gpu_status()); self.gpu_label.setWordWrap(True); self.gpu_label.setObjectName('muted'); of.addRow(self.gpu_label)
+        self.encoder = QComboBox(); self.encoder.addItems(['Авто — видеокарта NVIDIA, если есть', 'Только процессор']); of.addRow('Кодирование видео', self.encoder)
+        self.manual_pick = QCheckBox('Показать найденные моменты и выбрать вручную перед монтажом'); self.manual_pick.setChecked(True); of.addRow(self.manual_pick)
+        self.ai_desc = QCheckBox('Название, описание и хэштеги через локальный AI'); self.ai_desc.setChecked(True); of.addRow(self.ai_desc)
+        lay.addWidget(opts)
+        lay.addStretch(); self.tabs.addTab(self._scroll(tab), 'Новый проект')
+
+    def _build_design_tab(self):
+        tab = QWidget(); lay = QVBoxLayout(tab)
+        frame = QGroupBox('Картинка'); ff = QFormLayout(frame)
+        self.background = QComboBox(); self.background.addItems(['Размытое видео', 'Чёрные полосы']); ff.addRow('Фон вместо полос', self.background)
+        self.zoom = QComboBox(); self.zoom.addItems(ZOOM_ITEMS); self.zoom.setCurrentText('130%'); ff.addRow('Размер видео', self.zoom)
+        n = QLabel('Для горизонтального видео: чем крупнее, тем меньше фон, но сильнее обрезаются края. '
+                   'Если программа уверенно нашла говорящего, кадр заполняет весь экран.'); n.setWordWrap(True); n.setObjectName('muted'); ff.addRow(n)
+        self.hook = QCheckBox('Хук: самая цепляющая фраза ролика в первые секунды'); self.hook.setChecked(True); ff.addRow(self.hook)
+        self.punch = QCheckBox('Приближения на громких и эмоциональных моментах'); self.punch.setChecked(True); ff.addRow(self.punch)
+        lay.addWidget(frame)
+        subs = QGroupBox('Субтитры'); sf = QFormLayout(subs)
+        self.sub_preset = QComboBox(); self.sub_preset.addItems(list(SUB_PRESETS)); self.sub_preset.currentTextChanged.connect(self.apply_preset); sf.addRow('Стиль', self.sub_preset)
+        self.sub_font = QFontComboBox(); sf.addRow('Шрифт', self.sub_font)
+        self.sub_size = QSpinBox(); self.sub_size.setRange(30, 130); sf.addRow('Размер', self.sub_size)
+        self.sub_pos = QComboBox(); self.sub_pos.addItems(list(SUB_POSITIONS)); sf.addRow('Положение', self.sub_pos)
+        self.sub_color = QComboBox(); self.sub_color.addItems(list(ACTIVE_COLORS)); sf.addRow('Цвет текущего слова', self.sub_color)
+        self.sub_upper = QCheckBox('ЗАГЛАВНЫМИ БУКВАМИ'); sf.addRow(self.sub_upper)
+        self.srt = QCheckBox('Сохранять субтитры отдельным файлом .srt (для загрузки на площадку)'); self.srt.setChecked(True); sf.addRow(self.srt)
+        lay.addWidget(subs); lay.addStretch()
+        self.apply_preset(self.sub_preset.currentText())
+        self.tabs.addTab(self._scroll(tab), 'Оформление')
+
+    def _build_select_tab(self):
+        tab = QWidget(); lay = QVBoxLayout(tab)
+        self.select_title = QLabel('Здесь появятся найденные моменты, если включён ручной выбор.'); self.select_title.setStyleSheet('font-size:13pt;font-weight:600'); lay.addWidget(self.select_title)
+        split = QSplitter(Qt.Horizontal)
+        self.cand_list = QListWidget(); self.cand_list.currentRowChanged.connect(self.show_candidate)
+        self.cand_list.itemDoubleClicked.connect(self._toggle_item); split.addWidget(self.cand_list)
+        self.cand_detail = QTextEdit(); self.cand_detail.setReadOnly(True); split.addWidget(self.cand_detail); split.setSizes([480, 560])
+        lay.addWidget(split, 1)
+        row = QHBoxLayout()
+        b = QPushButton('Выбрать все'); b.clicked.connect(lambda: self._check_all(True)); row.addWidget(b)
+        b = QPushButton('Снять все'); b.clicked.connect(lambda: self._check_all(False)); row.addWidget(b)
+        row.addStretch()
+        self.skip_btn = QPushButton('Пропустить это видео'); self.skip_btn.clicked.connect(self.skip_video); row.addWidget(self.skip_btn)
+        self.render_btn = QPushButton('▶  Смонтировать выбранные'); self.render_btn.setObjectName('primary'); self.render_btn.clicked.connect(self.render_selected); row.addWidget(self.render_btn)
+        lay.addLayout(row); self._set_select_enabled(False)
+        self.tabs.addTab(tab, 'Выбор моментов')
+
+    def _build_results_tab(self):
+        tab = QWidget(); lay = QVBoxLayout(tab); split = QSplitter(Qt.Horizontal)
+        self.list = QListWidget(); self.list.currentRowChanged.connect(self.show_result)
+        self.list.itemDoubleClicked.connect(lambda _item: self.open_selected()); split.addWidget(self.list)
+        right = QWidget(); rv = QVBoxLayout(right); self.preview_title = QLabel('Готовые нарезки'); self.preview_title.setStyleSheet('font-size:18pt;font-weight:700'); self.preview_title.setWordWrap(True); rv.addWidget(self.preview_title)
+        self.detail = QTextEdit(); self.detail.setReadOnly(True); rv.addWidget(self.detail, 1)
+        row = QHBoxLayout()
+        for text, fn in (('Открыть видео', self.open_selected), ('Описание', self.open_description), ('Субтитры .srt', self.open_srt), ('Папка', self.open_folder)):
+            b = QPushButton(text); b.clicked.connect(fn); row.addWidget(b)
+        rv.addLayout(row)
+        split.addWidget(right); split.setSizes([380, 650]); lay.addWidget(split); self.tabs.addTab(tab, 'Результаты')
+
+    def _build_settings_tab(self):
+        tab = QWidget(); lay = QVBoxLayout(tab)
+        box = QGroupBox('Бесплатный локальный AI — без платных API'); form = QFormLayout(box)
+        self.local_model = QComboBox(); self.local_model.setEditable(True); self.local_model.addItems(['qwen3:4b', 'qwen3:8b', 'qwen2.5:7b']); form.addRow('Локальная модель', self.local_model)
+        self.ollama_url = QLineEdit('http://127.0.0.1:11434'); form.addRow('Адрес локального Ollama', self.ollama_url)
+        lay.addWidget(box)
+        info = QLabel('Рекомендация для RTX 4060 Laptop с 8 ГБ VRAM: qwen3:4b. Если Ollama недоступен, приложение переключается на встроенный офлайн-подбор, а описания делаются по шаблону.'); info.setWordWrap(True); info.setObjectName('muted'); lay.addWidget(info)
+        save = QPushButton('Сохранить настройки'); save.clicked.connect(lambda: self.save_settings(notify=True)); lay.addWidget(save)
+        updates = QGroupBox('Обновления'); uf = QFormLayout(updates)
+        self.auto_update_box = QCheckBox('Проверять обновления при запуске'); self.auto_update_box.setChecked(True); uf.addRow(self.auto_update_box)
+        update_btn = QPushButton('Проверить обновления сейчас'); update_btn.clicked.connect(lambda: self.check_for_updates(manual=True)); uf.addRow(update_btn)
+        self.github_owner = QLineEdit(DEFAULT_OWNER); self.github_repo = QLineEdit(DEFAULT_REPO)
+        uf.addRow('GitHub owner', self.github_owner); uf.addRow('GitHub repository', self.github_repo)
+        note = QLabel(f'Текущая версия: {APP_VERSION}. Обновление заменяет только файлы программы: настройки, библиотеки и готовые ролики сохраняются.')
+        note.setWordWrap(True); note.setObjectName('muted'); uf.addRow(note)
+        lay.addWidget(updates)
+        if os.name == 'nt':
+            sc = QGroupBox('Ярлык'); sl = QVBoxLayout(sc)
+            b = QPushButton('Создать ярлык на рабочем столе и в меню «Пуск»'); b.clicked.connect(lambda: self.make_shortcut(ask=False)); sl.addWidget(b)
+            lay.addWidget(sc)
+        lay.addStretch(); self.tabs.addTab(self._scroll(tab), 'Настройки')
+
+    # ------------------------------------------------------------------ settings
+    def apply_preset(self, name: str):
+        p = SUB_PRESETS.get(name)
+        if not p: return
+        self.sub_font.setCurrentFont(QFont(p['font'])); self.sub_size.setValue(int(p['size']))
+        self.sub_pos.setCurrentText(p['position']); self.sub_upper.setChecked(bool(p['upper']))
+        color = next((k for k, v in ACTIVE_COLORS.items() if v == p['active']), None)
+        if color: self.sub_color.setCurrentText(color)
+
+    def subtitle_style(self) -> dict:
+        return {'preset': self.sub_preset.currentText(), 'font': self.sub_font.currentFont().family(), 'size': self.sub_size.value(),
+                'position': self.sub_pos.currentText(), 'active': ACTIVE_COLORS[self.sub_color.currentText()], 'upper': self.sub_upper.isChecked()}
+
+    def collect_settings(self) -> dict:
+        return {'whisper_model': self.whisper.currentText(), 'device': self.device.currentText(),
+                'encoder': 'cpu' if self.encoder.currentIndex() == 1 else 'auto',
+                'ollama_url': self.ollama_url.text().strip(), 'local_model': self.local_model.currentText().strip(),
+                'zoom': int(self.zoom.currentText().split('%')[0]) / 100,
+                'background': 'black' if self.background.currentIndex() == 1 else 'blur',
+                'hook': self.hook.isChecked(), 'punch_ins': self.punch.isChecked(), 'srt': self.srt.isChecked(),
+                'ai_descriptions': self.ai_desc.isChecked(), 'manual_pick': self.manual_pick.isChecked(),
+                'subtitle_style': self.subtitle_style()}
+
+    def load_settings(self):
+        p = Path.home() / '.cloudy_clip_studio.json'
+        if not p.exists(): return
+        try:
+            d = json.loads(p.read_text(encoding='utf-8'))
+        except Exception:
+            return
+        self.local_model.setCurrentText(d.get('local_model', 'qwen3:4b'))
+        self.ollama_url.setText(d.get('ollama_url', 'http://127.0.0.1:11434'))
+        self.github_owner.setText(d.get('github_owner') or DEFAULT_OWNER); self.github_repo.setText(d.get('github_repo') or DEFAULT_REPO)
+        self.auto_update = d.get('auto_update', True); self.auto_update_box.setChecked(self.auto_update)
+        self.skip_version = d.get('skip_version', ''); self.shortcut_offered = d.get('shortcut_offered', False)
+        ui = d.get('ui', {})
+        for key, widget in (('whisper', self.whisper), ('device', self.device), ('zoom', self.zoom)):
+            if ui.get(key): widget.setCurrentText(ui[key])
+        for key, widget in (('encoder', self.encoder), ('background', self.background)):
+            if isinstance(ui.get(key), int): widget.setCurrentIndex(ui[key])
+        for key, widget in (('manual_pick', self.manual_pick), ('ai_desc', self.ai_desc), ('hook', self.hook),
+                            ('punch', self.punch), ('srt', self.srt)):
+            if key in ui: widget.setChecked(bool(ui[key]))
+        st = ui.get('subtitles') or {}
+        if st.get('preset') in SUB_PRESETS: self.sub_preset.setCurrentText(st['preset'])
+        if st.get('font'): self.sub_font.setCurrentFont(QFont(st['font']))
+        if st.get('size'): self.sub_size.setValue(int(st['size']))
+        if st.get('position') in SUB_POSITIONS: self.sub_pos.setCurrentText(st['position'])
+        color = next((k for k, v in ACTIVE_COLORS.items() if v == st.get('active')), None)
+        if color: self.sub_color.setCurrentText(color)
+        if 'upper' in st: self.sub_upper.setChecked(bool(st['upper']))
+        if ui.get('out_dir'): self.out_edit.setText(ui['out_dir'])
+
+    def save_settings(self, notify: bool = False):
+        d = {'use_local_ai': True, 'local_model': self.local_model.currentText().strip(), 'ollama_url': self.ollama_url.text().strip(),
+             'github_owner': self.github_owner.text().strip(), 'github_repo': self.github_repo.text().strip(),
+             'auto_update': self.auto_update_box.isChecked(), 'skip_version': self.skip_version,
+             'shortcut_offered': self.shortcut_offered,
+             'ui': {'whisper': self.whisper.currentText(), 'device': self.device.currentText(), 'zoom': self.zoom.currentText(),
+                    'encoder': self.encoder.currentIndex(), 'background': self.background.currentIndex(),
+                    'manual_pick': self.manual_pick.isChecked(), 'ai_desc': self.ai_desc.isChecked(), 'hook': self.hook.isChecked(),
+                    'punch': self.punch.isChecked(), 'srt': self.srt.isChecked(), 'subtitles': self.subtitle_style(),
+                    'out_dir': self.out_edit.text().strip()}}
+        (Path.home() / '.cloudy_clip_studio.json').write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8')
+        if notify: QMessageBox.information(self, 'Настройки', 'Сохранено. Облачные AI API отключены.')
+
+    def check_for_updates(self, manual: bool = True):
+        if getattr(self, '_update_thread', None) and self._update_thread.isRunning(): return
+        self._update_manual = manual
+        worker = UpdateCheckWorker(self.github_owner.text().strip(), self.github_repo.text().strip())
+        thread = QThread(); worker.moveToThread(thread)
+        thread.started.connect(worker.run); worker.found.connect(self._on_release); worker.failed.connect(self._on_release_error)
+        worker.found.connect(thread.quit); worker.failed.connect(thread.quit)
+        self._update_thread, self._update_worker = thread, worker
+        thread.start()
+
+    def _on_release_error(self, err: str):
+        if self._update_manual: QMessageBox.warning(self, 'Обновления', err)
+
+    def _on_release(self, release: dict):
+        tag = release.get('tag', '')
+        if not is_newer(tag):
+            if self._update_manual: QMessageBox.information(self, 'Обновления', f'У вас последняя версия ({APP_VERSION}).')
+            return
+        if not self._update_manual and tag == self.skip_version: return
+        box = QMessageBox(self); box.setWindowTitle('Доступно обновление'); box.setIcon(QMessageBox.Information)
+        box.setText(f'Доступна версия {tag} (у вас {APP_VERSION}).')
+        notes = release.get('body', '').strip()
+        box.setInformativeText((notes[:1500] + ('…' if len(notes) > 1500 else '')) if notes else 'Обновить сейчас?')
+        now = box.addButton('Обновить', QMessageBox.AcceptRole); box.addButton('Позже', QMessageBox.RejectRole)
+        skip = box.addButton('Пропустить эту версию', QMessageBox.DestructiveRole)
+        box.exec()
+        if box.clickedButton() == skip:
+            self.skip_version = tag; self.save_settings(); return
+        if box.clickedButton() != now: return
+        if self.cancel_btn.isEnabled():
+            QMessageBox.information(self, 'Обновление', 'Сейчас идёт обработка. Обновление можно установить после неё: Настройки → «Проверить обновления сейчас».')
+            return
+        self._download_update(release)
+
+    def _download_update(self, release: dict):
+        self.save_settings()
+        dlg = QProgressDialog('Скачиваю обновление…', None, 0, 100, self); dlg.setWindowTitle('Обновление')
+        dlg.setWindowModality(Qt.WindowModal); dlg.setMinimumDuration(0); dlg.setAutoClose(False); dlg.setValue(0)
+        self._update_dialog = dlg
+        worker = UpdateDownloadWorker(release, Path(__file__).resolve().parents[1])
+        thread = QThread(); worker.moveToThread(thread)
+        thread.started.connect(worker.run); worker.progress.connect(self._on_update_progress)
+        worker.done.connect(self._on_update_ready); worker.failed.connect(self._on_update_failed)
+        worker.done.connect(thread.quit); worker.failed.connect(thread.quit)
+        self._update_thread, self._update_worker = thread, worker
+        thread.start()
+
+    def _on_update_progress(self, done: int, total: int):
+        if total: self._update_dialog.setValue(int(done * 100 / total))
+        self._update_dialog.setLabelText(f'Скачиваю обновление… {done / 1e6:.1f} из {total / 1e6:.1f} МБ' if total else 'Скачиваю обновление…')
+
+    def _on_update_failed(self, err: str):
+        self._update_dialog.close(); QMessageBox.warning(self, 'Обновление не удалось', err)
+
+    def _on_update_ready(self):
+        self._update_dialog.close()
+        # The helper waits for this process to exit, swaps the files and starts the new version.
+        QApplication.quit()
+
+    def _offer_shortcut(self):
+        if os.name != 'nt' or self.shortcut_offered: return
+        try:
+            from .shortcuts import shortcut_exists
+            if shortcut_exists(): return
+        except Exception:
+            return
+        self.shortcut_offered = True; self.save_settings()
+        if QMessageBox.question(self, 'Ярлык', 'Создать ярлык Cloudy Clip Studio на рабочем столе и в меню «Пуск»?\n'
+                                'Программа будет запускаться без чёрного окна.') == QMessageBox.Yes:
+            self.make_shortcut(ask=False)
+
+    def make_shortcut(self, ask: bool = False):
+        try:
+            from .shortcuts import create_shortcuts
+            made = create_shortcuts()
+            QMessageBox.information(self, 'Ярлык', 'Готово:\n' + '\n'.join(str(p) for p in made))
+        except Exception as e:
+            QMessageBox.warning(self, 'Ярлык', f'Не удалось создать ярлык: {e}')
+
+    # ------------------------------------------------------------------ files
+    def add_sources(self, paths):
+        added = 0
+        for p in paths:
+            if p.lower().endswith(VIDEO_EXT) and p not in self.sources:
+                self.sources.append(p); self.src_list.addItem(p); added += 1
+        if added and not self.cancel_btn.isEnabled():
+            self.status.setText(f'Видео в списке: {len(self.sources)}. Нажмите «Начать обработку».')
+        return added
+
+    def pick_sources(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, 'Выберите видео', '', 'Видео (*.mp4 *.mov *.mkv *.avi *.webm)')
+        self.add_sources(paths)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls() and any(u.toLocalFile().lower().endswith(VIDEO_EXT) for u in e.mimeData().urls()):
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        if self.add_sources([u.toLocalFile() for u in e.mimeData().urls()]):
+            self.tabs.setCurrentIndex(0)
+
+    def remove_source(self):
+        row = self.src_list.currentRow()
+        if row >= 0: self.sources.pop(row); self.src_list.takeItem(row)
+
+    def clear_sources(self):
+        self.sources.clear(); self.src_list.clear()
+
+    def pick_banner(self):
+        p, _ = QFileDialog.getOpenFileName(self, 'Выберите анимационный баннер', '', 'Видео/GIF (*.mp4 *.mov *.webm *.gif *.mkv)')
+        if p: self.banner = p; self.banner_edit.setText(p)
+
+    def pick_output(self):
+        p = QFileDialog.getExistingDirectory(self, 'Папка для результатов', self.out_edit.text())
+        if p: self.out_edit.setText(p)
+
+    # ------------------------------------------------------------------ processing flow
+    def start_processing(self):
+        if not self.sources or not self.banner:
+            QMessageBox.warning(self, 'Не хватает файлов', 'Добавьте хотя бы одно видео и выберите баннер.'); return
+        if not ffmpeg_available():
+            QMessageBox.critical(self, 'Не найден FFmpeg', 'Установите FFmpeg и добавьте ffmpeg.exe и ffprobe.exe в PATH. Инструкция есть в README.'); return
+        bad = []
+        try:
+            if probe(self.banner)['duration'] <= 0: raise RuntimeError('Не удалось прочитать длительность баннера.')
+            for s in self.sources:
+                if probe(s)['duration'] < 90: bad.append(Path(s).name)
+        except Exception as e:
+            QMessageBox.critical(self, 'Проверка файлов', str(e)); return
+        if bad:
+            QMessageBox.critical(self, 'Слишком короткие видео', 'Эти видео короче 90 секунд:\n' + '\n'.join(bad)); return
+        self.save_settings()
+        self.run_settings = self.collect_settings()
+        self.queue = list(self.sources); self.total_videos = len(self.queue); self._cancelled = False
+        self.results = []; self.list.clear()
+        self.start_btn.setEnabled(False); self.cancel_btn.setEnabled(True)
+        self._t_start = time.monotonic(); self._eta = -1.0
+        _keep_awake(True)
+        self._next_video()
+
+    def _run(self, worker, on_finished, on_failed):
+        # Keep Python references to threads/workers until they finish (GC would delete them mid-run).
+        self._threads = [(t, w) for t, w in self._threads if t.isRunning()]
+        thread = QThread(); worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self.on_progress); worker.eta.connect(self.on_eta)
+        worker.finished.connect(on_finished); worker.failed.connect(on_failed)
+        worker.finished.connect(thread.quit); worker.failed.connect(thread.quit)
+        self._threads.append((thread, worker)); self.worker = worker
+        thread.start()
+
+    def _next_video(self):
+        if self._cancelled or not self.queue:
+            self._finish_all(); return
+        self.current_source = self.queue.pop(0)
+        done = self.total_videos - len(self.queue)
+        self.current_out = output_dir_for(self.out_edit.text().strip(), self.current_source)
+        self.queue_label.setText(f'Видео {done} из {self.total_videos}: {Path(self.current_source).name}' if self.total_videos > 1
+                                 else Path(self.current_source).name)
+        self._eta = -1.0
+        self.progress.setValue(0)
+        self._run(AnalyzeWorker(self.current_source, self.banner, self.current_out, self.run_settings), self.on_analyzed, self.on_failed)
+
+    def on_analyzed(self, payload: dict):
+        self.analysis = payload
+        if self._cancelled: self._finish_all(); return
+        if self.run_settings.get('manual_pick', True):
+            self._fill_candidates(payload)
+            self.tabs.setCurrentIndex(2); self._eta = -1.0
+            self.status.setText('Отметьте моменты и нажмите «Смонтировать выбранные».')
+            self._notify('Моменты найдены', f"{Path(payload['source']).name}: выберите, что монтировать.")
+        else:
+            self._start_render(payload['clips'])
+
+    def _start_render(self, clips: list[dict]):
+        if not clips: self._next_video(); return
+        p = self.analysis
+        self._run(RenderWorker(p['source'], self.banner, p['out_dir'], self.run_settings, clips, p['words']), self.on_rendered, self.on_failed)
+
+    def on_rendered(self, results: list, msg: str):
+        self.results.extend(results)
+        for r in results:
+            ok = '✓' if r.get('quality_passed') else '•'
+            self.list.addItem(QListWidgetItem(f"{ok} {Path(r['file']).name}\n{Path(r['file']).parent.name} • {r['banner']['duration']:.0f} с • оценка {r['score']:.0f}"))
+        self._next_video()
+
+    def on_failed(self, error: str):
+        name = Path(self.current_source).name if self.current_source else ''
+        if self._cancelled: self._finish_all(); return
+        QMessageBox.critical(self, 'Ошибка обработки', f'{name}\n\n{error}')
+        self._next_video()
+
+    def _finish_all(self):
+        self.start_btn.setEnabled(True); self.cancel_btn.setEnabled(False); self._set_select_enabled(False)
+        self.queue_label.setText('')
+        msg = 'Обработка остановлена' if self._cancelled else 'Обработка завершена'
+        took = f' за {_human(time.monotonic() - self._t_start)}' if self._t_start else ''
+        self.status.setText(f'{msg}{took}. Создано роликов: {len(self.results)}')
+        self._t_start = None; self._eta = -1.0; self.eta_label.setText(''); self.setWindowTitle('Cloudy Clip Studio')
+        _keep_awake(False)
+        if not self._cancelled:
+            self._notify('Готово', f'Создано роликов: {len(self.results)}{took}')
+        if self.results:
+            self.tabs.setCurrentIndex(3); self.list.setCurrentRow(0)
+        elif not self._cancelled:
+            QMessageBox.warning(self, 'Нет результатов', 'Не удалось создать нарезки. Проверьте длину видео и звук.')
+
+    def cancel_processing(self):
+        self._cancelled = True; self.queue.clear()
+        if self.worker: self.worker.cancel()
+        if self.render_btn.isEnabled():  # waiting on the selection screen
+            self._finish_all()
+        self.status.setText('Запрошена остановка. Текущий ролик будет завершён.')
+
+    def on_progress(self, p, msg):
+        self.progress.setValue(p)
+        if msg: self.progress_label.setText(msg)
+        self.setWindowTitle(f'{p}% — Cloudy Clip Studio')  # visible on the taskbar while minimised
+
+    def on_eta(self, seconds: float):
+        self._eta = seconds; self._eta_at = time.monotonic(); self._tick()
+
+    def _tick(self):
+        if self._t_start is None: return
+        elapsed = _human(time.monotonic() - self._t_start)
+        waiting = self.render_btn.isEnabled()
+        if waiting:
+            self.eta_label.setText(f'ждёт вашего выбора • прошло {elapsed}')
+        elif self._eta >= 0:
+            left = max(0.0, self._eta - (time.monotonic() - self._eta_at))
+            more = f' (+ ещё видео: {len(self.queue)})' if self.queue else ''
+            self.eta_label.setText(f'Осталось ≈ {_human(left)}{more} • прошло {elapsed}')
+        else:
+            self.eta_label.setText(f'Оцениваю время… • прошло {elapsed}')
+
+    def _notify(self, title: str, text: str):
+        QApplication.alert(self)  # flashes the taskbar button
+        QApplication.beep()
+        if self.tray:
+            self.tray.show(); self.tray.showMessage(f'Cloudy Clip Studio — {title}', text, QSystemTrayIcon.Information, 8000)
+
+    # ------------------------------------------------------------------ selection screen
+    def _set_select_enabled(self, on: bool):
+        self.render_btn.setEnabled(on); self.skip_btn.setEnabled(on)
+
+    def _fill_candidates(self, payload: dict):
+        self.cand_list.clear()
+        clips = sorted(payload['clips'], key=lambda c: c['start'])
+        payload['clips'] = clips
+        self.select_title.setText(f"{Path(payload['source']).name}: найдено моментов — {len(clips)}")
+        for c in clips:
+            title = c.get('title') or 'Без названия'
+            item = QListWidgetItem(f"{_fmt(c['start'])}–{_fmt(c['end'])}  ({c['end'] - c['start']:.0f} с)  •  {c.get('score', 0):.0f}/100\n{title}")
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable); item.setCheckState(Qt.Checked)
+            self.cand_list.addItem(item)
+        self._set_select_enabled(True)
+        if clips: self.cand_list.setCurrentRow(0)
+
+    def show_candidate(self, row: int):
+        if not self.analysis or row < 0 or row >= len(self.analysis['clips']): return
+        c = self.analysis['clips'][row]
+        self.cand_detail.setPlainText(f"Отрезок исходника: {_fmt(c['start'])}–{_fmt(c['end'])}\nОценка: {c.get('score', 0):.0f}/100\n"
+                                      f"Почему: {c.get('reason') or '—'}\nХук: {c.get('hook') or '—'}\n\nТекст:\n{c.get('transcript', '')}")
+
+    def _toggle_item(self, item):
+        item.setCheckState(Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked)
+
+    def _check_all(self, on: bool):
+        for i in range(self.cand_list.count()):
+            self.cand_list.item(i).setCheckState(Qt.Checked if on else Qt.Unchecked)
+
+    def render_selected(self):
+        if not self.analysis: return
+        chosen = [c for i, c in enumerate(self.analysis['clips']) if self.cand_list.item(i).checkState() == Qt.Checked]
+        if not chosen:
+            QMessageBox.information(self, 'Ничего не выбрано', 'Отметьте хотя бы один момент или нажмите «Пропустить это видео».'); return
+        self._set_select_enabled(False); self.tabs.setCurrentIndex(0)
+        self._start_render(sorted(chosen, key=lambda c: c.get('score', 0), reverse=True))
+
+    def skip_video(self):
+        self._set_select_enabled(False); self.cand_list.clear(); self.tabs.setCurrentIndex(0)
+        self._next_video()
+
+    # ------------------------------------------------------------------ results
+    def show_result(self, row):
+        if row < 0 or row >= len(self.results): return
+        r = self.results[row]
+        self.preview_title.setText(r.get('title') or Path(r['file']).name)
+        speaker = r.get('speaker_tracking', {}); scan = r.get('quality_scan', {}); b = r['banner']
+        warnings = r.get('quality_warnings', [])
+        desc = Path(r['description_file']).read_text(encoding='utf-8') if Path(r['description_file']).exists() else ''
+        self.detail.setPlainText(
+            f"Файл: {r['file']}\nИсходный отрезок: {_fmt(r['start'])}–{_fmt(r['end'])}\nДлительность: {b['duration']:.1f} с\n"
+            f"Оценка: {r['score']:.0f}/100\nПочему выбран: {r['reason'] or '—'}\n"
+            f"Хук в начале: {str(b.get('hook_seconds', 0)) + ' с' if b.get('hook_seconds') else 'нет'} ({r.get('hook') or '—'})\n"
+            f"Приближения: {len(b.get('punch_ins', []))}\nБаннеров: {b['banner_count']} (на {b['banner_positions']} с)\n"
+            f"Кадрирование: {speaker.get('reason', 'не запускалось')}\nКодирование: {b.get('encoder', '—')}\n"
+            f"Проверка качества: {'выполнена' if scan.get('scan_completed') else 'не завершена'}\n"
+            f"Предупреждения: {', '.join(warnings) or 'нет'}\n\nОписание:\n{desc}")
+
+    def _selected(self):
+        row = self.list.currentRow()
+        return self.results[row] if 0 <= row < len(self.results) else None
+
+    def open_selected(self):
+        r = self._selected()
+        if r: QDesktopServices.openUrl(QUrl.fromLocalFile(r['file']))
+
+    def open_description(self):
+        r = self._selected()
+        if r: QDesktopServices.openUrl(QUrl.fromLocalFile(r['description_file']))
+
+    def open_srt(self):
+        r = self._selected()
+        if r and r.get('srt_file'): QDesktopServices.openUrl(QUrl.fromLocalFile(r['srt_file']))
+
+    def open_folder(self):
+        r = self._selected()
+        folder = str(Path(r['file']).parent) if r else self.out_edit.text().strip()
+        QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+
+
+def main():
+    app = QApplication([]); app.setStyleSheet(STYLE); app.setFont(QFont('Segoe UI', 10)); w = MainWindow()
+    screen = app.primaryScreen().availableGeometry()
+    if screen.height() < 900 or screen.width() < 1300: w.showMaximized()  # laptop screens
+    else: w.show()
+    app.exec()

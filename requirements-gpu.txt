@@ -1,0 +1,4 @@
+# NVIDIA libraries for speech recognition on the GPU (RTX cards). ~1.3 GB download.
+# cuDNN must match the cudnn64_9.dll bundled with ctranslate2 4.9 (9.10.2.21).
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cudnn-cu12==9.10.2.21
