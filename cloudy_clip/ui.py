@@ -1,7 +1,7 @@
 from __future__ import annotations
 import json, os, sys, time
 from pathlib import Path
-from PySide6.QtCore import QThread, Qt, QUrl, QTimer, QObject, Signal, Slot
+from PySide6.QtCore import QThread, Qt, QUrl, QTimer, QObject, Signal, Slot, QSize
 from PySide6.QtGui import QDesktopServices, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QFileDialog, QProgressBar, QListWidget, QListWidgetItem, QMessageBox,
@@ -11,31 +11,74 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
 from .pipeline import AnalyzeWorker, RenderWorker, output_dir_for, data_dir_for
 from .media import (ffmpeg_available, probe, render_preview_frame, build_sentences, which, NO_WINDOW,
                     SUB_PRESETS, SUB_POSITIONS, ACTIVE_COLORS)
+from .widgets import (Switch, NavStack, DropZone, SourceCard, Stepper, Segmented, ThumbWorker, svg_icon,
+                      placeholder_thumb, rounded)
 from .updater import (APP_VERSION, DEFAULT_OWNER, DEFAULT_REPO, check_release, download_and_stage, is_newer,
                       UpdateError)
 
 STYLE = '''
-QMainWindow,QWidget { background:#10131b; color:#eef1f8; font-family:Segoe UI; font-size:10pt; }
-QLabel#hero {font-size:20pt;font-weight:700;color:#ffffff;}
-QLabel#eta {color:#c9bfff;font-weight:600;}
-QScrollArea {border:0;background:transparent;}
-QFrame#bottom {background:#141a26;border:1px solid #293244;border-radius:12px;}
-QLabel#muted {color:#9aa5b5;}
-QGroupBox {border:1px solid #293244;border-radius:12px;margin-top:12px;padding:14px;font-weight:600;}
-QGroupBox::title {subcontrol-origin:margin;left:12px;padding:0 5px;color:#a9b8ce;}
-QLineEdit,QComboBox,QTextEdit,QListWidget,QSpinBox,QFontComboBox {background:#171d29;border:1px solid #303b50;border-radius:8px;padding:7px;color:#f4f6fb;}
-QPushButton {background:#27344a;border:0;border-radius:9px;padding:10px 16px;color:white;font-weight:600;}
-QPushButton:hover {background:#344766;} QPushButton#primary {background:#6b55e8;} QPushButton#primary:hover {background:#806df2;}
-QPushButton:disabled, QPushButton#primary:disabled {background:#1c2433;color:#8a95a8;}
-QProgressBar {background:#1b2331;border:0;border-radius:7px;height:16px;text-align:center;color:white;}
-QProgressBar::chunk {background:#6b55e8;border-radius:7px;}
-QTabWidget::pane {border:1px solid #293244;border-radius:10px;} QTabBar::tab {background:#171d29;padding:10px 18px;border-radius:7px;margin:3px;} QTabBar::tab:selected {background:#394867;}
-QCheckBox::indicator, QListWidget::indicator {width:16px;height:16px;border:1px solid #5a6a86;border-radius:4px;background:#171d29;}
-QCheckBox::indicator:checked, QListWidget::indicator:checked {background:#6b55e8;border-color:#8b78ff;}
-QListWidget::item {padding:6px;}
-QTableWidget {background:#171d29;border:1px solid #303b50;border-radius:8px;gridline-color:#263043;color:#f4f6fb;selection-background-color:#2c3a55;}
-QHeaderView::section {background:#1c2433;color:#a9b8ce;border:0;padding:6px;font-weight:600;}
-QTableCornerButton::section {background:#1c2433;border:0;} QListWidget::item:selected {background:#2c3a55;}
+QMainWindow { background:#0E1116; }
+QWidget { color:#E8ECF2; font-family:'Inter','Segoe UI'; font-size:10pt; }
+QLabel { background:transparent; }
+QLabel#hero { font-size:20pt; font-weight:700; color:#FFFFFF; }
+QLabel#h1 { font-size:18pt; font-weight:700; color:#FFFFFF; }
+QLabel#h2 { font-size:12pt; font-weight:600; color:#FFFFFF; }
+QLabel#muted { color:#93A0B4; }
+QLabel#eta { color:#D7DDE7; }
+QLabel#chip { background:#262D3A; color:#C3CBD8; border-radius:10px; padding:3px 10px; font-size:9pt; }
+QLabel#chipok { background:#1C3A31; color:#7FE3C3; border-radius:10px; padding:3px 10px; font-size:9pt; }
+QLabel#badge { background:#2A3140; color:#D7DDE7; border-radius:9px; padding:1px 8px; font-size:9pt; }
+QFrame#sidebar { background:#12161D; border-right:1px solid #222935; }
+QFrame#sidefoot { background:#161B23; border:1px solid #222935; border-radius:12px; }
+QFrame#card, QGroupBox { background:#161B23; border:1px solid #222935; border-radius:14px; }
+QGroupBox { margin-top:14px; padding:18px 16px 14px 16px; font-weight:600; }
+QGroupBox::title { subcontrol-origin:margin; left:14px; top:2px; padding:0 4px; color:#A9B8CE; }
+QFrame#dropzone { background:#131820; border:2px dashed #313A4A; border-radius:16px; }
+QFrame#dropzone:hover { border-color:#6E5CF0; }
+QFrame#bottom { background:#12161D; border-top:1px solid #222935; }
+QFrame#segmented { background:#0F1319; border-radius:10px; }
+QPushButton#seg { background:transparent; border:0; border-radius:8px; color:#B4BFCF; padding:0 12px; }
+QPushButton#seg:checked { background:#6E5CF0; color:#FFFFFF; font-weight:600; }
+QPushButton#nav { text-align:left; padding:0 12px; border:0; border-radius:10px; background:transparent; color:#B4BFCF; font-weight:500; }
+QPushButton#nav:hover { background:#1A202A; color:#FFFFFF; }
+QPushButton#nav:checked { background:#1E2430; color:#FFFFFF; font-weight:600; }
+QPushButton { background:#252C3A; border:0; border-radius:10px; padding:9px 16px; color:#FFFFFF; font-weight:600; }
+QPushButton:hover { background:#2F3849; }
+QPushButton#primary { background:#6E5CF0; } QPushButton#primary:hover { background:#7F6EF4; }
+QPushButton#ghost { background:transparent; border:1px solid #2A3140; color:#D7DDE7; font-weight:500; }
+QPushButton#ghost:hover { border-color:#3A4456; background:#151A22; }
+QPushButton#link { background:transparent; color:#A99CFF; padding:6px 0; font-weight:500; text-align:left; }
+QPushButton#icon { background:transparent; padding:0; border-radius:8px; }
+QPushButton#icon:hover { background:#1E2430; }
+QPushButton#soft { background:#252C3A; }
+QPushButton:disabled, QPushButton#primary:disabled { background:#1C2433; color:#6C7789; }
+QLineEdit, QComboBox, QTextEdit, QSpinBox, QFontComboBox { background:#0F1319; border:1px solid #2A3140; border-radius:9px; padding:7px 10px; color:#F4F6FB; }
+QComboBox::drop-down { border:0; width:24px; }
+QComboBox QAbstractItemView { background:#161B23; border:1px solid #2A3140; selection-background-color:#2C3A55; }
+QListWidget { background:transparent; border:0; outline:0; }
+QListWidget::item { border-radius:12px; padding:6px; color:#E8ECF2; }
+QListWidget::item:selected { background:#1E2430; border:1px solid #6E5CF0; }
+QListWidget::item:hover:!selected { background:#151A22; }
+QListWidget::indicator { width:18px; height:18px; border:1.5px solid #8A97AB; border-radius:5px; background:#0F1319; }
+QListWidget::indicator:checked { background:#6E5CF0; border-color:#6E5CF0; }
+QProgressBar { background:#232A36; border:0; border-radius:4px; max-height:8px; min-height:8px; text-align:center; color:transparent; }
+QProgressBar::chunk { background:#6E5CF0; border-radius:4px; }
+QTabWidget::pane { border:0; }
+QTabBar::tab { background:#0F1319; color:#B4BFCF; padding:8px 18px; border-radius:8px; margin:2px; }
+QTabBar::tab:selected { background:#252C3A; color:#FFFFFF; }
+QScrollArea { border:0; background:transparent; }
+QScrollBar:vertical { background:transparent; width:10px; margin:2px; }
+QScrollBar::handle:vertical { background:#2A3140; border-radius:4px; min-height:30px; }
+QScrollBar::add-line, QScrollBar::sub-line { height:0; width:0; }
+QScrollBar:horizontal { background:transparent; height:10px; margin:2px; }
+QScrollBar::handle:horizontal { background:#2A3140; border-radius:4px; min-width:30px; }
+QSlider::groove:horizontal { height:4px; background:#2A3140; border-radius:2px; }
+QSlider::handle:horizontal { background:#FFFFFF; width:14px; height:14px; margin:-5px 0; border-radius:7px; }
+QSlider::sub-page:horizontal { background:#6E5CF0; border-radius:2px; }
+QTableWidget { background:#0F1319; border:1px solid #2A3140; border-radius:10px; gridline-color:#202734; color:#F4F6FB; selection-background-color:#2C3A55; }
+QHeaderView::section { background:#161B23; color:#A9B8CE; border:0; padding:6px; font-weight:600; }
+QTableCornerButton::section { background:#161B23; border:0; }
+QToolTip { background:#1E2430; color:#E8ECF2; border:1px solid #2A3140; padding:6px; }
 '''
 
 ZOOM_ITEMS = ['100% — весь кадр', '115%', '130%', '150%', '175% — почти без полос']
@@ -254,12 +297,12 @@ class PreviewPane(QWidget):
         title = QLabel('Превью кадра'); title.setStyleSheet('font-weight:600'); v.addWidget(title)
         self.image = QLabel(hint or 'Добавьте видео, чтобы увидеть превью'); self.image.setAlignment(Qt.AlignCenter)
         self.image.setFixedSize(252, 448); self.image.setWordWrap(True)
-        self.image.setStyleSheet('background:#0b0e14;border:1px solid #303b50;border-radius:10px;color:#7f8a9c;padding:12px;')
+        self.image.setStyleSheet('background:#0B0E13;border:1px solid #2A3140;border-radius:14px;color:#7F8A9C;padding:12px;')
         v.addWidget(self.image, 0, Qt.AlignHCenter)
         self.slider = QSlider(Qt.Horizontal); self.slider.setEnabled(False); self.slider.setFixedWidth(252)
         self.slider.valueChanged.connect(self._on_slider); v.addWidget(self.slider)
         self.time_label = QLabel(''); self.time_label.setObjectName('muted'); self.time_label.setAlignment(Qt.AlignCenter); v.addWidget(self.time_label)
-        self.speaker = QCheckBox('По говорящему'); self.speaker.setToolTip('Показать, куда программа повернёт кадр, если найдёт лицо. Считается несколько секунд.')
+        self.speaker = Switch('По говорящему'); self.speaker.setToolTip('Показать, куда программа повернёт кадр, если найдёт лицо. Считается несколько секунд.')
         self.speaker.toggled.connect(lambda _: self.request())
         self.speaker.toggled.connect(lambda on: self.win.sync_preview_speaker(on, self))
         if speaker_option: v.addWidget(self.speaker)
@@ -328,6 +371,21 @@ class PreviewPane(QWidget):
         self.note.setText('Не удалось построить превью: ' + err); self._finish()
 
 
+def apply_theme(app):
+    """Dark palette for everything the stylesheet does not paint (scroll areas, viewports, popups)."""
+    from PySide6.QtGui import QPalette, QColor
+    pal = QPalette()
+    for role, color in ((QPalette.Window, '#0E1116'), (QPalette.Base, '#0F1319'), (QPalette.AlternateBase, '#161B23'),
+                        (QPalette.Text, '#E8ECF2'), (QPalette.WindowText, '#E8ECF2'), (QPalette.Button, '#252C3A'),
+                        (QPalette.ButtonText, '#FFFFFF'), (QPalette.Highlight, '#6E5CF0'), (QPalette.HighlightedText, '#FFFFFF'),
+                        (QPalette.ToolTipBase, '#1E2430'), (QPalette.ToolTipText, '#E8ECF2'), (QPalette.PlaceholderText, '#6C7789')):
+        pal.setColor(role, QColor(color))
+    app.setPalette(pal); app.setStyleSheet(STYLE)
+    f = QFont('Inter', 10)
+    if not f.exactMatch(): f = QFont('Segoe UI', 10)
+    app.setFont(f)
+
+
 def resource_path(relative: str) -> Path:
     base = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parents[1]))
     return base / relative
@@ -372,13 +430,16 @@ class MainWindow(QMainWindow):
         icon = resource_path('assets/icon.ico')
         self.setWindowIcon(QIcon(str(icon)) if icon.exists() else self.style().standardIcon(QStyle.SP_MediaPlay))
         self.auto_update = True; self.skip_version = ''; self.shortcut_offered = False; self._update_manual = False
-        root = QWidget(); self.setCentralWidget(root); outer = QVBoxLayout(root); outer.setContentsMargins(18, 12, 18, 12); outer.setSpacing(8)
-        head = QHBoxLayout(); title = QLabel('Cloudy Clip Studio'); title.setObjectName('hero'); head.addWidget(title)
-        sub = QLabel('  длинные записи → вертикальные ролики'); sub.setObjectName('muted'); head.addWidget(sub); head.addStretch()
-        badge = QLabel(f'{APP_VERSION} • локальная обработка'); badge.setObjectName('muted'); head.addWidget(badge); outer.addLayout(head)
-        self.tabs = QTabWidget(); outer.addWidget(self.tabs, 1)
+        self.resize(1320, 860)
+        root = QWidget(); self.setCentralWidget(root); outer = QHBoxLayout(root); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
+        self.tabs = NavStack([('Проект', 'plus'), ('Оформление', 'palette'), ('Моменты', 'grid'), ('Результаты', 'phone'), ('Настройки', 'gear')])
+        outer.addWidget(self.tabs.sidebar)
+        right = QWidget(); rv = QVBoxLayout(right); rv.setContentsMargins(0, 0, 0, 0); rv.setSpacing(0)
+        rv.addWidget(self.tabs, 1); outer.addWidget(right, 1)
+        self._thumb_threads: list = []
         self._build_project_tab(); self._build_design_tab(); self._build_select_tab(); self._build_results_tab(); self._build_settings_tab()
-        outer.addWidget(self._build_bottom_bar())
+        rv.addWidget(self._build_bottom_bar())
+        self._refresh_sidebar_status()
         self._loading = True
         self.load_settings()
         self._loading = False
@@ -388,6 +449,30 @@ class MainWindow(QMainWindow):
         self.clock = QTimer(self); self.clock.timeout.connect(self._tick); self.clock.start(1000)
         QTimer.singleShot(1500, self._offer_shortcut)
         if self.auto_update: QTimer.singleShot(3000, lambda: self.check_for_updates(manual=False))
+
+    def _refresh_sidebar_status(self):
+        txt = self._gpu_status()
+        ready = txt.startswith('✓')
+        self.tabs.gpu_line.setText(('●  RTX готова' if ready else '●  Видеокарта не настроена') if 'NVIDIA' in txt else '●  Процессор')
+        self.tabs.gpu_line.setStyleSheet(f"color:{'#7FE3C3' if ready else '#E8C77F'};")
+        self.tabs.gpu_line.setToolTip(txt)
+        self.tabs.version_line.setText(f'Версия {APP_VERSION}')
+
+    @staticmethod
+    def _page(title: str, subtitle: str = '', action: QWidget | None = None):
+        """Page shell: centred column (max 1040 px) with a header."""
+        page = QWidget(); outer = QHBoxLayout(page); outer.setContentsMargins(40, 32, 40, 24)
+        outer.setSizeConstraint(QHBoxLayout.SetMinimumSize)   # scroll instead of squeezing cards into each other
+        col = QWidget(); col.setMaximumWidth(1040); lay = QVBoxLayout(col); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(18)
+        head = QHBoxLayout(); texts = QVBoxLayout(); texts.setSpacing(4)
+        t = QLabel(title); t.setObjectName('h1'); texts.addWidget(t)
+        if subtitle:
+            st = QLabel(subtitle); st.setObjectName('muted'); st.setWordWrap(True); texts.addWidget(st)
+        head.addLayout(texts, 1)
+        if action is not None: head.addWidget(action, 0, Qt.AlignBottom)
+        lay.addLayout(head)
+        outer.addStretch(); outer.addWidget(col, 100); outer.addStretch()
+        return page, lay
 
     @staticmethod
     def _gpu_status() -> str:
@@ -408,63 +493,79 @@ class MainWindow(QMainWindow):
         return area
 
     def _build_bottom_bar(self) -> QWidget:
-        bar = QFrame(); bar.setObjectName('bottom'); bar.setMinimumHeight(92); v = QVBoxLayout(bar); v.setContentsMargins(14, 10, 14, 10); v.setSpacing(6)
-        row = QHBoxLayout()
-        self.start_btn = QPushButton('▶  Начать обработку'); self.start_btn.setObjectName('primary'); self.start_btn.clicked.connect(self.start_processing)
-        self.cancel_btn = QPushButton('Отменить'); self.cancel_btn.setEnabled(False); self.cancel_btn.clicked.connect(self.cancel_processing)
-        self.progress = QProgressBar(); self.progress.setValue(0)
-        row.addWidget(self.start_btn); row.addWidget(self.progress, 1); row.addWidget(self.cancel_btn); v.addLayout(row)
-        info = QHBoxLayout()
-        self.progress_label = QLabel('Готово к работе. Перетащите видео в окно или нажмите «Добавить видео».'); self.progress_label.setObjectName('muted')
+        bar = QFrame(); bar.setObjectName('bottom'); h = QHBoxLayout(bar); h.setContentsMargins(40, 14, 40, 14); h.setSpacing(20)
+        self.stepper = Stepper(); h.addWidget(self.stepper)
+        mid = QVBoxLayout(); mid.setSpacing(6)
+        self.progress = QProgressBar(); self.progress.setValue(0); self.progress.setTextVisible(False)
+        info = QHBoxLayout(); info.setSpacing(12)
+        self.progress_label = QLabel('Перетащите видео в окно или нажмите «Выбрать файлы».'); self.progress_label.setObjectName('muted')
         self.queue_label = QLabel(''); self.queue_label.setObjectName('muted')
         self.eta_label = QLabel(''); self.eta_label.setObjectName('eta')
-        info.addWidget(self.progress_label, 1); info.addWidget(self.queue_label); info.addSpacing(16); info.addWidget(self.eta_label); v.addLayout(info)
+        info.addWidget(self.progress_label, 1); info.addWidget(self.queue_label); info.addWidget(self.eta_label)
+        mid.addWidget(self.progress); mid.addLayout(info); h.addLayout(mid, 1)
+        self.cancel_btn = QPushButton('Отменить'); self.cancel_btn.setObjectName('ghost'); self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setMinimumHeight(44); self.cancel_btn.clicked.connect(self.cancel_processing)
+        self.start_btn = QPushButton('  Начать обработку'); self.start_btn.setObjectName('primary'); self.start_btn.setMinimumHeight(44)
+        self.start_btn.setIcon(svg_icon('play', '#FFFFFF', 14)); self.start_btn.clicked.connect(self.start_processing)
+        h.addWidget(self.cancel_btn); h.addWidget(self.start_btn)
         self.status = self.progress_label
         return bar
 
     # ------------------------------------------------------------------ tabs
     def _build_project_tab(self):
-        tab = QWidget(); lay = QVBoxLayout(tab); lay.setSpacing(12)
-        files = QGroupBox('1. Исходные материалы'); fl = QVBoxLayout(files)
-        fl.addWidget(QLabel('Видео (можно несколько — обработаются по очереди). Файлы можно перетащить прямо в окно:'))
-        self.src_list = QListWidget(); self.src_list.setMinimumHeight(70); self.src_list.setMaximumHeight(130); fl.addWidget(self.src_list)
-        row = QHBoxLayout()
-        b = QPushButton('Добавить видео'); b.clicked.connect(self.pick_sources); row.addWidget(b)
-        b = QPushButton('Убрать выбранное'); b.clicked.connect(self.remove_source); row.addWidget(b)
-        b = QPushButton('Очистить'); b.clicked.connect(self.clear_sources); row.addWidget(b); row.addStretch(); fl.addLayout(row)
-        form = QFormLayout()
-        self.banner_edit = QLineEdit(self.banner); self.banner_edit.setReadOnly(True); br = QHBoxLayout(); br.addWidget(self.banner_edit, 1)
-        bb = QPushButton('Выбрать баннер'); bb.clicked.connect(self.pick_banner); br.addWidget(bb); form.addRow('Баннер CLOUDY', br)
-        self.out_edit = QLineEdit(str(Path.home() / 'Videos' / 'CloudyClipStudio')); orow = QHBoxLayout(); orow.addWidget(self.out_edit, 1)
-        ob = QPushButton('Папка'); ob.clicked.connect(self.pick_output); orow.addWidget(ob); form.addRow('Папка результата', orow)
-        fl.addLayout(form); lay.addWidget(files)
+        open_btn = QPushButton('Открыть папку с роликами'); open_btn.setObjectName('ghost'); open_btn.clicked.connect(self.open_folder)
+        page, lay = self._page('Новый проект', 'Длинное видео → серия вертикальных роликов с субтитрами', open_btn)
+        self.drop = DropZone(); self.drop.setMinimumHeight(210); self.drop.clicked.connect(self.pick_sources); lay.addWidget(self.drop)
+        self.src_list = QListWidget(); self.src_list.setSpacing(4); self.src_list.setSelectionMode(QListWidget.NoSelection)
+        self.src_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff); self.src_list.hide(); lay.addWidget(self.src_list)
 
-        opts = QGroupBox('2. Обработка'); of = QFormLayout(opts)
+        cards = QHBoxLayout(); cards.setSpacing(16)
+        left = QFrame(); left.setObjectName('card'); lv = QVBoxLayout(left); lv.setContentsMargins(20, 18, 20, 18); lv.setSpacing(12)
+        t = QLabel('Сколько роликов'); t.setObjectName('h2'); lv.addWidget(t)
+        self.fill_clips = QComboBox(); self.fill_clips.addItems(['Как можно больше — нейросеть + добор из остального видео', 'Только лучшие — что выбрала нейросеть'])
+        self.fill_clips.hide(); lv.addWidget(self.fill_clips)
+        lv.addWidget(Segmented(self.fill_clips, ['Как можно больше', 'Только лучшие']))
+        self.fill_note = QLabel(''); self.fill_note.setObjectName('muted'); self.fill_note.setWordWrap(True); lv.addWidget(self.fill_note)
+        self.fill_clips.currentIndexChanged.connect(lambda i: self.fill_note.setText(
+            'Моменты от нейросети + добор из остального видео' if i == 0 else 'Только то, что выбрала нейросеть'))
+        self.fill_note.setText('Моменты от нейросети + добор из остального видео'); lv.addStretch()
+        right = QFrame(); right.setObjectName('card'); rv = QVBoxLayout(right); rv.setContentsMargins(20, 14, 20, 14); rv.setSpacing(4)
+        self.manual_pick = Switch('Выбрать моменты вручную перед монтажом'); self.manual_pick.setChecked(True); rv.addWidget(self.manual_pick)
+        self.ai_desc = Switch('Название, описание и хэштеги через AI'); self.ai_desc.setChecked(True); rv.addWidget(self.ai_desc)
+        self.more_btn = QPushButton('Дополнительно: модель, устройство, кодирование, папки  ›'); self.more_btn.setObjectName('link')
+        self.more_btn.setCheckable(True); rv.addWidget(self.more_btn); rv.addStretch()
+        left.setMinimumHeight(150); right.setMinimumHeight(150)
+        cards.addWidget(left, 1); cards.addWidget(right, 1); lay.addLayout(cards)
+
+        self.more = QFrame(); self.more.setObjectName('card'); of = QFormLayout(self.more); of.setContentsMargins(20, 18, 20, 18); of.setSpacing(10)
         self.whisper = QComboBox(); self.whisper.addItems(['small', 'medium', 'large-v3-turbo', 'large-v3']); self.whisper.setCurrentText('large-v3-turbo'); of.addRow('Модель распознавания', self.whisper)
         model_note = QLabel('large-v3-turbo — лучший баланс. large-v3 точнее совсем чуть-чуть, но в несколько раз медленнее. '
                             'small — самая быстрая, текст немного хуже.'); model_note.setWordWrap(True); model_note.setObjectName('muted'); of.addRow(model_note)
         self.device = QComboBox(); self.device.addItems(['auto', 'cuda', 'cpu']); of.addRow('Устройство распознавания', self.device)
         self.gpu_label = QLabel(self._gpu_status()); self.gpu_label.setWordWrap(True); self.gpu_label.setObjectName('muted'); of.addRow(self.gpu_label)
         self.encoder = QComboBox(); self.encoder.addItems(['Авто — видеокарта NVIDIA, если есть', 'Только процессор']); of.addRow('Кодирование видео', self.encoder)
-        self.fill_clips = QComboBox(); self.fill_clips.addItems(['Как можно больше — нейросеть + добор из остального видео', 'Только лучшие — что выбрала нейросеть'])
-        of.addRow('Количество роликов', self.fill_clips)
-        self.manual_pick = QCheckBox('Показать найденные моменты и выбрать вручную перед монтажом'); self.manual_pick.setChecked(True); of.addRow(self.manual_pick)
-        self.ai_desc = QCheckBox('Название, описание и хэштеги через локальный AI'); self.ai_desc.setChecked(True); of.addRow(self.ai_desc)
-        lay.addWidget(opts)
-        lay.addStretch(); self.tabs.addTab(self._scroll(tab), 'Новый проект')
+        self.out_edit = QLineEdit(str(Path.home() / 'Videos' / 'CloudyClipStudio')); orow = QHBoxLayout(); orow.addWidget(self.out_edit, 1)
+        ob = QPushButton('Выбрать'); ob.setObjectName('ghost'); ob.clicked.connect(self.pick_output); orow.addWidget(ob); of.addRow('Папка для роликов', orow)
+        self.banner_edit = QLineEdit(self.banner); self.banner_edit.setReadOnly(True); br = QHBoxLayout(); br.addWidget(self.banner_edit, 1)
+        bb = QPushButton('Выбрать'); bb.setObjectName('ghost'); bb.clicked.connect(self.pick_banner); br.addWidget(bb); of.addRow('Рекламный баннер', br)
+        self.more.setMinimumHeight(360); self.more.hide(); lay.addWidget(self.more)
+        self.more_btn.toggled.connect(lambda on: (self.more.setVisible(on), self.more_btn.setText(
+            'Дополнительно: модель, устройство, кодирование, папки  ' + ('⌄' if on else '›'))))
+        lay.addStretch()
+        self.tabs.addTab(self._scroll(page), 'Новый проект')
 
     def _build_design_tab(self):
-        tab = QWidget(); lay = QVBoxLayout(tab)
+        tab, lay = self._page('Оформление', 'Как будут выглядеть ролики. Справа — кадр из вашего видео с текущими настройками.')
         frame = QGroupBox('Картинка'); ff = QFormLayout(frame)
         self.background = QComboBox(); self.background.addItems(['Размытое видео', 'Чёрные полосы']); ff.addRow('Фон вместо полос', self.background)
         self.zoom = QComboBox(); self.zoom.addItems(ZOOM_ITEMS); self.zoom.setCurrentText('130%'); ff.addRow('Размер видео', self.zoom)
         n = QLabel('Для горизонтального видео: чем крупнее, тем меньше фон, но сильнее обрезаются края. '
                    'Если программа уверенно нашла говорящего, кадр заполняет весь экран.'); n.setWordWrap(True); n.setObjectName('muted'); ff.addRow(n)
-        self.hook = QCheckBox('Хук: самая цепляющая фраза ролика в первые секунды'); self.hook.setChecked(True); ff.addRow(self.hook)
-        self.punch = QCheckBox('Приближения на громких и эмоциональных моментах'); self.punch.setChecked(True); ff.addRow(self.punch)
-        self.speaker_crop = QCheckBox('Кадрирование по говорящему: если найдено лицо, кадр заполняет весь экран и следует за ним')
+        self.hook = Switch('Хук: самая цепляющая фраза ролика в первые секунды'); self.hook.setChecked(True); ff.addRow(self.hook)
+        self.punch = Switch('Приближения на громких и эмоциональных моментах'); self.punch.setChecked(True); ff.addRow(self.punch)
+        self.speaker_crop = Switch('Кадрирование по говорящему: если найдено лицо, кадр заполняет весь экран и следует за ним')
         self.speaker_crop.setChecked(True); ff.addRow(self.speaker_crop)
-        self.soft_follow = QCheckBox('Мягкое слежение за лицом: увеличенное видео плавно сдвигается за лицом, чтобы его не обрезало')
+        self.soft_follow = Switch('Мягкое слежение за лицом: увеличенное видео плавно сдвигается за лицом, чтобы его не обрезало')
         self.soft_follow.setChecked(True); ff.addRow(self.soft_follow)
         lay.addWidget(frame)
         subs = QGroupBox('Субтитры'); sf = QFormLayout(subs)
@@ -473,9 +574,9 @@ class MainWindow(QMainWindow):
         self.sub_size = QSpinBox(); self.sub_size.setRange(30, 130); sf.addRow('Размер', self.sub_size)
         self.sub_pos = QComboBox(); self.sub_pos.addItems(list(SUB_POSITIONS)); sf.addRow('Положение', self.sub_pos)
         self.sub_color = QComboBox(); self.sub_color.addItems(list(ACTIVE_COLORS)); sf.addRow('Цвет текущего слова', self.sub_color)
-        self.sub_upper = QCheckBox('ЗАГЛАВНЫМИ БУКВАМИ'); sf.addRow(self.sub_upper)
-        self.srt = QCheckBox('Сохранять субтитры отдельным файлом .srt (для загрузки на площадку)'); self.srt.setChecked(True); sf.addRow(self.srt)
-        self.save_txt = QCheckBox('Сохранять описание ролика отдельным файлом .txt рядом с роликом'); self.save_txt.setChecked(False); sf.addRow(self.save_txt)
+        self.sub_upper = Switch('ЗАГЛАВНЫМИ БУКВАМИ'); sf.addRow(self.sub_upper)
+        self.srt = Switch('Сохранять субтитры отдельным файлом .srt (для загрузки на площадку)'); self.srt.setChecked(True); sf.addRow(self.srt)
+        self.save_txt = Switch('Сохранять описание ролика отдельным файлом .txt рядом с роликом'); self.save_txt.setChecked(False); sf.addRow(self.save_txt)
         lay.addWidget(subs); lay.addStretch()
         self.apply_preset(self.sub_preset.currentText())
         page = QWidget(); h = QHBoxLayout(page); h.setContentsMargins(0, 0, 0, 0)
@@ -493,53 +594,76 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
     def _build_select_tab(self):
-        tab = QWidget(); lay = QVBoxLayout(tab)
-        self.select_title = QLabel('Здесь появятся найденные моменты, если включён ручной выбор.'); self.select_title.setStyleSheet('font-size:13pt;font-weight:600'); lay.addWidget(self.select_title)
-        split = QSplitter(Qt.Horizontal)
-        self.cand_list = QListWidget(); self.cand_list.currentRowChanged.connect(self.show_candidate)
-        self.cand_list.itemDoubleClicked.connect(self._toggle_item); split.addWidget(self.cand_list)
-        right = QWidget(); rh = QHBoxLayout(right); rh.setContentsMargins(0, 0, 0, 0)
+        tab = QWidget(); lay = QVBoxLayout(tab); lay.setContentsMargins(32, 26, 32, 16); lay.setSpacing(14)
+        head = QHBoxLayout(); texts = QVBoxLayout(); texts.setSpacing(4)
+        t = QLabel('Моменты'); t.setObjectName('h1'); texts.addWidget(t)
+        self.select_title = QLabel('Здесь появятся найденные моменты, если включён ручной выбор.'); self.select_title.setObjectName('muted'); texts.addWidget(self.select_title)
+        head.addLayout(texts, 1)
+        b = QPushButton('Выбрать все'); b.setObjectName('ghost'); b.clicked.connect(lambda: self._check_all(True)); head.addWidget(b, 0, Qt.AlignBottom)
+        b = QPushButton('Снять все'); b.setObjectName('ghost'); b.clicked.connect(lambda: self._check_all(False)); head.addWidget(b, 0, Qt.AlignBottom)
+        lay.addLayout(head)
+        split = QSplitter(Qt.Horizontal); split.setHandleWidth(10)
+        self.cand_list = QListWidget(); self.cand_list.setViewMode(QListWidget.IconMode); self.cand_list.setResizeMode(QListWidget.Adjust)
+        self.cand_list.setMovement(QListWidget.Static); self.cand_list.setIconSize(QSize(150, 266)); self.cand_list.setGridSize(QSize(176, 350))
+        self.cand_list.setWordWrap(True); self.cand_list.setSpacing(6); self.cand_list.setUniformItemSizes(True)
+        self.cand_list.currentRowChanged.connect(self.show_candidate); self.cand_list.itemDoubleClicked.connect(self._toggle_item)
+        self.cand_list.itemChanged.connect(lambda *_: self._update_pick_count())
+        split.addWidget(self.cand_list)
+        right = QFrame(); right.setObjectName('card'); rh = QHBoxLayout(right); rh.setContentsMargins(14, 14, 14, 14); rh.setSpacing(12)
         self.select_preview = PreviewPane(self, speaker_option=True, hint='Выберите момент слева')
-        pw = QWidget(); pv = QVBoxLayout(pw); pv.setContentsMargins(6, 0, 6, 0); pv.addWidget(self.select_preview)
-        pw_area = self._scroll(pw); pw_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); pw_area.setFixedWidth(290)
+        pw = QWidget(); pv = QVBoxLayout(pw); pv.setContentsMargins(0, 0, 0, 0); pv.addWidget(self.select_preview)
+        pw_area = self._scroll(pw); pw_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); pw_area.setFixedWidth(278)
         rh.addWidget(pw_area)
         self.cand_detail = QTextEdit(); self.cand_detail.setReadOnly(True)
         self.caption_editor = CaptionEditor(self)
         self.detail_tabs = QTabWidget(); self.detail_tabs.addTab(self.cand_detail, 'Описание'); self.detail_tabs.addTab(self.caption_editor, 'Субтитры')
         rh.addWidget(self.detail_tabs, 1)
-        split.addWidget(right); split.setSizes([380, 700])
+        split.addWidget(right); split.setStretchFactor(0, 3); split.setStretchFactor(1, 4); split.setSizes([520, 700])
         lay.addWidget(split, 1)
         row = QHBoxLayout()
-        b = QPushButton('Выбрать все'); b.clicked.connect(lambda: self._check_all(True)); row.addWidget(b)
-        b = QPushButton('Снять все'); b.clicked.connect(lambda: self._check_all(False)); row.addWidget(b)
-        row.addStretch()
-        self.skip_btn = QPushButton('Пропустить это видео'); self.skip_btn.clicked.connect(self.skip_video); row.addWidget(self.skip_btn)
-        self.render_btn = QPushButton('▶  Смонтировать выбранные'); self.render_btn.setObjectName('primary'); self.render_btn.clicked.connect(self.render_selected); row.addWidget(self.render_btn)
+        self.pick_count = QLabel(''); self.pick_count.setObjectName('muted'); row.addWidget(self.pick_count); row.addStretch()
+        self.skip_btn = QPushButton('Пропустить видео'); self.skip_btn.setObjectName('ghost'); self.skip_btn.setMinimumHeight(42); self.skip_btn.clicked.connect(self.skip_video); row.addWidget(self.skip_btn)
+        self.render_btn = QPushButton('Смонтировать выбранные'); self.render_btn.setObjectName('primary'); self.render_btn.setMinimumHeight(42); self.render_btn.clicked.connect(self.render_selected); row.addWidget(self.render_btn)
         lay.addLayout(row); self._set_select_enabled(False)
         self.tabs.addTab(tab, 'Выбор моментов')
 
     def _build_results_tab(self):
-        tab = QWidget(); lay = QVBoxLayout(tab); split = QSplitter(Qt.Horizontal)
-        self.list = QListWidget(); self.list.currentRowChanged.connect(self.show_result)
-        self.list.itemDoubleClicked.connect(lambda _item: self.open_selected()); split.addWidget(self.list)
-        right = QWidget(); rv = QVBoxLayout(right); self.preview_title = QLabel('Готовые нарезки'); self.preview_title.setStyleSheet('font-size:18pt;font-weight:700'); self.preview_title.setWordWrap(True); rv.addWidget(self.preview_title)
+        tab = QWidget(); lay = QVBoxLayout(tab); lay.setContentsMargins(32, 26, 32, 16); lay.setSpacing(14)
+        head = QHBoxLayout(); texts = QVBoxLayout(); texts.setSpacing(4)
+        t = QLabel('Результаты'); t.setObjectName('h1'); texts.addWidget(t)
+        self.results_title = QLabel('Готовые ролики появятся здесь.'); self.results_title.setObjectName('muted'); texts.addWidget(self.results_title)
+        head.addLayout(texts, 1)
+        b = QPushButton('Открыть папку'); b.setObjectName('ghost'); b.clicked.connect(self.open_folder); head.addWidget(b, 0, Qt.AlignBottom)
+        lay.addLayout(head)
+        split = QSplitter(Qt.Horizontal); split.setHandleWidth(10)
+        self.list = QListWidget(); self.list.setViewMode(QListWidget.IconMode); self.list.setResizeMode(QListWidget.Adjust)
+        self.list.setMovement(QListWidget.Static); self.list.setIconSize(QSize(150, 266)); self.list.setGridSize(QSize(176, 350))
+        self.list.setWordWrap(True); self.list.setSpacing(6); self.list.setUniformItemSizes(True)
+        self.list.currentRowChanged.connect(self.show_result); self.list.itemDoubleClicked.connect(lambda _item: self.open_selected())
+        split.addWidget(self.list)
+        right = QFrame(); right.setObjectName('card'); rv = QVBoxLayout(right); rv.setContentsMargins(18, 16, 18, 16); rv.setSpacing(10)
+        self.preview_title = QLabel('Выберите ролик'); self.preview_title.setObjectName('h2'); self.preview_title.setWordWrap(True); rv.addWidget(self.preview_title)
+        row = QHBoxLayout(); row.setSpacing(8)
+        for text, fn, icon, kind in (('Открыть', self.open_selected, 'play', 'primary'), ('Копировать описание', self.open_description, 'copy', 'soft'),
+                                     ('.srt', self.open_srt, None, 'ghost'), ('Папка', self.open_folder, 'folder', 'ghost')):
+            b = QPushButton(text); b.setObjectName(kind); b.clicked.connect(fn)
+            if icon: b.setIcon(svg_icon(icon, '#FFFFFF' if kind != 'ghost' else '#D7DDE7', 14))
+            row.addWidget(b)
+        row.addStretch(); rv.addLayout(row)
         self.detail = QTextEdit(); self.detail.setReadOnly(True); rv.addWidget(self.detail, 1)
-        row = QHBoxLayout()
-        for text, fn in (('Открыть видео', self.open_selected), ('Копировать описание', self.open_description), ('Субтитры .srt', self.open_srt), ('Папка', self.open_folder)):
-            b = QPushButton(text); b.clicked.connect(fn); row.addWidget(b)
-        rv.addLayout(row)
-        split.addWidget(right); split.setSizes([380, 650]); lay.addWidget(split); self.tabs.addTab(tab, 'Результаты')
+        split.addWidget(right); split.setStretchFactor(0, 3); split.setStretchFactor(1, 2); split.setSizes([700, 460])
+        lay.addWidget(split, 1)
+        self.tabs.addTab(tab, 'Результаты')
 
     def _build_settings_tab(self):
-        tab = QWidget(); lay = QVBoxLayout(tab)
+        tab, lay = self._page('Настройки', 'Все настройки сохраняются автоматически.')
         box = QGroupBox('Бесплатный локальный AI — без платных API'); form = QFormLayout(box)
         self.local_model = QComboBox(); self.local_model.setEditable(True); self.local_model.addItems(['qwen3:4b', 'qwen3:8b', 'qwen2.5:7b']); form.addRow('Локальная модель', self.local_model)
         self.ollama_url = QLineEdit('http://127.0.0.1:11434'); form.addRow('Адрес локального Ollama', self.ollama_url)
         lay.addWidget(box)
         info = QLabel('Рекомендация для RTX 4060 Laptop с 8 ГБ VRAM: qwen3:4b. Если Ollama недоступен, приложение переключается на встроенный офлайн-подбор, а описания делаются по шаблону.'); info.setWordWrap(True); info.setObjectName('muted'); lay.addWidget(info)
-        saved = QLabel('Все настройки программы сохраняются автоматически при каждом изменении.'); saved.setObjectName('muted'); lay.addWidget(saved)
         updates = QGroupBox('Обновления'); uf = QFormLayout(updates)
-        self.auto_update_box = QCheckBox('Проверять обновления при запуске'); self.auto_update_box.setChecked(True); uf.addRow(self.auto_update_box)
+        self.auto_update_box = Switch('Проверять обновления при запуске'); self.auto_update_box.setChecked(True); uf.addRow(self.auto_update_box)
         update_btn = QPushButton('Проверить обновления сейчас'); update_btn.clicked.connect(lambda: self.check_for_updates(manual=True)); uf.addRow(update_btn)
         self.github_owner = QLineEdit(DEFAULT_OWNER); self.github_repo = QLineEdit(DEFAULT_REPO)
         uf.addRow('GitHub owner', self.github_owner); uf.addRow('GitHub repository', self.github_repo)
@@ -765,7 +889,7 @@ class MainWindow(QMainWindow):
         added = 0
         for p in paths:
             if p.lower().endswith(VIDEO_EXT) and p not in self.sources:
-                self.sources.append(p); self.src_list.addItem(p); added += 1
+                self.sources.append(p); self._add_source_card(p); added += 1
         if added and not self.cancel_btn.isEnabled():
             self.status.setText(f'Видео в списке: {len(self.sources)}. Нажмите «Начать обработку».')
         if added: self._sources_changed()
@@ -783,17 +907,43 @@ class MainWindow(QMainWindow):
         if self.add_sources([u.toLocalFile() for u in e.mimeData().urls()]):
             self.tabs.setCurrentIndex(0)
 
+    def _add_source_card(self, path: str):
+        info, ok = '', True
+        try:
+            pr = probe(path); info = f"{_fmt(pr['duration'])} · {pr['width']}×{pr['height']}"
+            out = Path(output_dir_for(self.out_edit.text().strip(), path))
+            if (out / '.cloudy' / 'transcript_cache.json').exists(): info += ' · расшифровка сохранена'
+            if pr['duration'] < 90: info += ' · короче 90 с'; ok = False
+        except Exception:
+            info, ok = 'не удалось прочитать файл', False
+        card = SourceCard(path, info, 'Готово к обработке' if ok else 'Слишком короткое', ok)
+        card.removed.connect(self._remove_source_path)
+        item = QListWidgetItem(); item.setSizeHint(QSize(100, 78)); item.setData(Qt.UserRole, path)
+        self.src_list.addItem(item); self.src_list.setItemWidget(item, card)
+        self._fit_source_list()
+
+    def _fit_source_list(self):
+        n = self.src_list.count()
+        self.src_list.setVisible(n > 0); self.src_list.setFixedHeight(min(n, 4) * 82 + 4)
+
+    def _remove_source_path(self, path: str):
+        for i in range(self.src_list.count()):
+            if self.src_list.item(i).data(Qt.UserRole) == path:
+                self.src_list.takeItem(i); break
+        if path in self.sources: self.sources.remove(path)
+        self._fit_source_list(); self._sources_changed()
+
     def _sources_changed(self):
         if self.tabs.currentIndex() == 1: self._sync_design_preview()
 
     def remove_source(self):
         row = self.src_list.currentRow()
         if row >= 0: self.sources.pop(row); self.src_list.takeItem(row)
-        self._sources_changed()
+        self._fit_source_list(); self._sources_changed()
 
     def clear_sources(self):
         self.sources.clear(); self.src_list.clear()
-        self._sources_changed()
+        self._fit_source_list(); self._sources_changed()
 
     def pick_banner(self):
         p, _ = QFileDialog.getOpenFileName(self, 'Выберите анимационный баннер', '', 'Видео/GIF (*.mp4 *.mov *.webm *.gif *.mkv)')
@@ -821,7 +971,8 @@ class MainWindow(QMainWindow):
         self.save_settings()
         self.run_settings = self.collect_settings()
         self.queue = list(self.sources); self.total_videos = len(self.queue); self._cancelled = False
-        self.results = []; self.list.clear()
+        self.results = []; self.list.clear(); self.tabs.set_badge(3, ''); self.results_title.setText('Готовые ролики появятся здесь.')
+        self.stepper.set_step(0)
         self.start_btn.setEnabled(False); self.cancel_btn.setEnabled(True)
         self._t_start = time.monotonic(); self._eta = -1.0
         _keep_awake(True)
@@ -867,10 +1018,19 @@ class MainWindow(QMainWindow):
         self._run(RenderWorker(p['source'], self.banner, p['out_dir'], self.run_settings, clips, p['words']), self.on_rendered, self.on_failed)
 
     def on_rendered(self, results: list, msg: str):
+        start = len(self.results)
         self.results.extend(results)
-        for r in results:
-            ok = '✓' if r.get('quality_passed') else '•'
-            self.list.addItem(QListWidgetItem(f"{ok} {Path(r['file']).name}\n{Path(r['file']).parent.name} • {r['banner']['duration']:.0f} с • оценка {r['score']:.0f}"))
+        jobs = []
+        for n, r in enumerate(results, start):
+            title = r.get('title') or Path(r['file']).stem
+            item = QListWidgetItem(f"{title}\n{Path(r['file']).parent.name}")
+            item.setIcon(QIcon(rounded(placeholder_thumb(), badge=_fmt(r['banner']['duration']))))
+            item.setToolTip(Path(r['file']).name)
+            self.list.addItem(item)
+            jobs.append({'key': f'res:{n}', 'kind': 'frame', 'source': r['file'], 't': min(4.0, r['banner']['duration'] / 3)})
+        self._start_thumbs(jobs)
+        self.tabs.set_badge(3, str(len(self.results)))
+        self.results_title.setText(f'Готово роликов: {len(self.results)} · двойной щелчок — открыть')
         self._next_video()
 
     def on_failed(self, error: str):
@@ -881,7 +1041,7 @@ class MainWindow(QMainWindow):
 
     def _finish_all(self):
         self.start_btn.setEnabled(True); self.cancel_btn.setEnabled(False); self._set_select_enabled(False)
-        self.queue_label.setText('')
+        self.queue_label.setText(''); self.stepper.set_step(3 if not self._cancelled and self.results else -1)
         msg = 'Обработка остановлена' if self._cancelled else 'Обработка завершена'
         took = f' за {_human(time.monotonic() - self._t_start)}' if self._t_start else ''
         self.status.setText(f'{msg}{took}. Создано роликов: {len(self.results)}')
@@ -903,6 +1063,7 @@ class MainWindow(QMainWindow):
 
     def on_progress(self, p, msg):
         self.progress.setValue(p)
+        self.stepper.set_step(0 if p < 38 else 1 if p < 50 else 2)
         if msg: self.progress_label.setText(msg)
         self.setWindowTitle(f'{p}% — Cloudy Clip Studio')  # visible on the taskbar while minimised
 
@@ -936,14 +1097,53 @@ class MainWindow(QMainWindow):
         self.cand_list.clear()
         clips = sorted(payload['clips'], key=lambda c: c['start'])
         payload['clips'] = clips
-        self.select_title.setText(f"{Path(payload['source']).name}: найдено моментов — {len(clips)}")
-        for c in clips:
-            title = c.get('title') or 'Без названия'
-            item = QListWidgetItem(f"{_fmt(c['start'])}–{_fmt(c['end'])}  ({c['end'] - c['start']:.0f} с)  •  {c.get('score', 0):.0f}/100\n{title}")
+        self.select_title.setText(f"{Path(payload['source']).name} · найдено моментов: {len(clips)}")
+        jobs = []
+        st = self.preview_settings()
+        for n, c in enumerate(clips):
+            title = c.get('title') or ('Добор' if str(c.get('reason', '')).startswith('Добор') else 'Без названия')
+            dur = c['end'] - c['start']
+            score = 'добор' if str(c.get('reason', '')).startswith('Добор') else f"{c.get('score', 0):.0f}/100"
+            item = QListWidgetItem(f"{title}\n{_fmt(c['start'])} · {score}")
+            item.setIcon(QIcon(rounded(placeholder_thumb(), badge=_fmt(dur))))
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable); item.setCheckState(Qt.Checked)
+            item.setToolTip(c.get('reason') or '')
             self.cand_list.addItem(item)
-        self._set_select_enabled(True)
+            jobs.append({'key': f'cand:{n}', 'kind': 'clip', 'source': payload['source'], 't': c['start'] + min(8.0, dur / 3),
+                         'words': payload['words'], 'zoom': st['zoom'], 'background': st['background'], 'style': st['style']})
+        self._start_thumbs(jobs)
+        self.tabs.set_badge(2, str(len(clips)))
+        self._set_select_enabled(True); self._update_pick_count()
         if clips: self.cand_list.setCurrentRow(0)
+
+    def _update_pick_count(self):
+        n = sum(1 for i in range(self.cand_list.count()) if self.cand_list.item(i).checkState() == Qt.Checked)
+        total = self.cand_list.count()
+        self.pick_count.setText(f'Отмечено {n} из {total}' if total else '')
+        self.render_btn.setText(f'Смонтировать {n} ' + ('ролик' if n % 10 == 1 and n % 100 != 11 else 'ролика' if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else 'роликов')
+                                if total else 'Смонтировать выбранные')
+
+    def _start_thumbs(self, jobs: list[dict]):
+        if not jobs: return
+        self._thumb_threads = [(t, w) for t, w in self._thumb_threads if t.isRunning()]
+        worker = ThumbWorker(jobs); thread = QThread(); worker.moveToThread(thread)
+        thread.started.connect(worker.run); worker.ready.connect(self._on_thumb); worker.done.connect(thread.quit)
+        self._thumb_threads.append((thread, worker)); thread.start()
+
+    def _on_thumb(self, key: str, path: str):
+        kind, _, idx = key.partition(':')
+        lst = self.cand_list if kind == 'cand' else self.list
+        i = int(idx)
+        if i >= lst.count(): return
+        item = lst.item(i); pm = QPixmap(path)
+        if pm.isNull(): return
+        if kind == 'cand':
+            c = self.analysis['clips'][i] if self.analysis and i < len(self.analysis['clips']) else None
+            badge = _fmt(c['end'] - c['start']) if c else ''
+        else:
+            r = self.results[i] if i < len(self.results) else None
+            badge = _fmt(r['banner']['duration']) if r else ''
+        item.setIcon(QIcon(rounded(pm, badge=badge)))
 
     def show_candidate(self, row: int):
         if not self.analysis or row < 0 or row >= len(self.analysis['clips']): return
@@ -984,7 +1184,7 @@ class MainWindow(QMainWindow):
 
     def skip_video(self):
         self._save_edited_captions()
-        self._set_select_enabled(False); self.cand_list.clear(); self.tabs.setCurrentIndex(0)
+        self._set_select_enabled(False); self.cand_list.clear(); self.tabs.set_badge(2, ''); self.tabs.setCurrentIndex(0)
         self._next_video()
 
     # ------------------------------------------------------------------ results
@@ -1031,7 +1231,7 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    app = QApplication([]); app.setStyleSheet(STYLE); app.setFont(QFont('Segoe UI', 10)); w = MainWindow()
+    app = QApplication([]); apply_theme(app); w = MainWindow()
     screen = app.primaryScreen().availableGeometry()
     if screen.height() < 900 or screen.width() < 1300: w.showMaximized()  # laptop screens
     else: w.show()
