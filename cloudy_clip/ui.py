@@ -78,21 +78,24 @@ class PreviewWorker(QObject):
         r = self.req
         try:
             note = ''
-            cx = None
+            cx = fx = None
             if r.get('speaker'):
-                from .speaker import analyze_active_speaker
+                from .speaker import analyze_active_speaker, soft_follow_keyframes
                 a, b = max(0.0, r['t'] - 2.5), r['t'] + 2.5
-                sp = analyze_active_speaker(r['source'], a, b, r.get('words') or [])
-                kf = sp.get('keyframes') or []
-                if kf:
-                    rel = r['t'] - a
-                    cx = min(kf, key=lambda k: abs(k[0] - rel))[1]
-                    note = 'кадр по говорящему'
-                else:
-                    note = 'говорящий не найден — весь кадр'
+                rel = r['t'] - a
+                if r.get('crop_on', True):
+                    kf = analyze_active_speaker(r['source'], a, b, r.get('words') or []).get('keyframes') or []
+                    if kf:
+                        cx = min(kf, key=lambda k: abs(k[0] - rel))[1]; note = 'кадр по говорящему (на весь экран)'
+                if cx is None and r.get('follow_on', True):
+                    kf = soft_follow_keyframes(r['source'], a, b, sample_fps=3).get('keyframes') or []
+                    if kf:
+                        fx = min(kf, key=lambda k: abs(k[0] - rel))[1]; note = 'мягкое слежение: кадр сдвинут к лицу'
+                if cx is None and fx is None:
+                    note = 'лицо не найдено — кадр по центру'
             out = os.path.join(r['dir'], f"preview_{r['id']}.png")
             render_preview_frame(r['source'], r['t'], out, words=r.get('words'), zoom=r['zoom'], background=r['background'],
-                                 subtitle_style=r['style'], crop_center_x=cx, info=r.get('info'))
+                                 subtitle_style=r['style'], crop_center_x=cx, info=r.get('info'), follow_center_x=fx)
             self.done.emit(out, note, r['id'])
         except Exception as e:
             self.failed.emit(str(e)[:300], r['id'])
@@ -159,7 +162,8 @@ class PreviewPane(QWidget):
         st = self.win.preview_settings()
         req = {'id': self._req_id, 'source': self.source, 't': self.current_time(), 'words': self.words,
                'info': self.info, 'dir': self._dir,
-               'speaker': self.speaker.isChecked() and self.win.speaker_crop.isChecked(), **st}
+               'speaker': self.speaker.isChecked() and (self.win.speaker_crop.isChecked() or self.win.soft_follow.isChecked()),
+               'crop_on': self.win.speaker_crop.isChecked(), 'follow_on': self.win.soft_follow.isChecked(), **st}
         self.note.setText('Обновляю…')
         self._threads = [(t, w) for t, w in self._threads if t.isRunning()]
         worker = PreviewWorker(req); thread = QThread(); worker.moveToThread(thread)
@@ -175,8 +179,8 @@ class PreviewPane(QWidget):
         pm = QPixmap(path)
         if not pm.isNull():
             self.image.setPixmap(pm.scaled(self.image.width() - 4, self.image.height() - 4, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        if not note and self.win.speaker_crop.isChecked():
-            note = ('Показан весь кадр с фоном. В ролике, если программа найдёт лицо, кадр будет на весь экран — '
+        if not note and (self.win.speaker_crop.isChecked() or self.win.soft_follow.isChecked()):
+            note = ('Кадр по центру. В ролике кадр подстроится под лицо, если программа его найдёт — '
                     'включите «По говорящему», чтобы увидеть.')
         self.note.setText(note); self._finish()
 
@@ -318,6 +322,8 @@ class MainWindow(QMainWindow):
         self.punch = QCheckBox('Приближения на громких и эмоциональных моментах'); self.punch.setChecked(True); ff.addRow(self.punch)
         self.speaker_crop = QCheckBox('Кадрирование по говорящему: если найдено лицо, кадр заполняет весь экран и следует за ним')
         self.speaker_crop.setChecked(True); ff.addRow(self.speaker_crop)
+        self.soft_follow = QCheckBox('Мягкое слежение за лицом: увеличенное видео плавно сдвигается за лицом, чтобы его не обрезало')
+        self.soft_follow.setChecked(True); ff.addRow(self.soft_follow)
         lay.addWidget(frame)
         subs = QGroupBox('Субтитры'); sf = QFormLayout(subs)
         self.sub_preset = QComboBox(); self.sub_preset.addItems(list(SUB_PRESETS)); self.sub_preset.currentTextChanged.connect(self.apply_preset); sf.addRow('Стиль', self.sub_preset)
@@ -337,7 +343,8 @@ class MainWindow(QMainWindow):
         h.addWidget(side_area)
         for sig in (self.background.currentIndexChanged, self.zoom.currentIndexChanged, self.sub_preset.currentIndexChanged,
                     self.sub_font.currentFontChanged, self.sub_size.valueChanged, self.sub_pos.currentIndexChanged,
-                    self.sub_color.currentIndexChanged, self.sub_upper.toggled, self.speaker_crop.toggled):
+                    self.sub_color.currentIndexChanged, self.sub_upper.toggled, self.speaker_crop.toggled,
+                    self.soft_follow.toggled):
             sig.connect(lambda *_: self.design_preview.request())
         self.tabs.addTab(page, 'Оформление')
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -446,7 +453,7 @@ class MainWindow(QMainWindow):
                 'zoom': int(self.zoom.currentText().split('%')[0]) / 100,
                 'background': 'black' if self.background.currentIndex() == 1 else 'blur',
                 'hook': self.hook.isChecked(), 'punch_ins': self.punch.isChecked(), 'srt': self.srt.isChecked(),
-                'speaker_crop': self.speaker_crop.isChecked(),
+                'speaker_crop': self.speaker_crop.isChecked(), 'soft_follow': self.soft_follow.isChecked(),
                 'ai_descriptions': self.ai_desc.isChecked(), 'manual_pick': self.manual_pick.isChecked(),
                 'subtitle_style': self.subtitle_style()}
 
@@ -468,7 +475,8 @@ class MainWindow(QMainWindow):
         for key, widget in (('encoder', self.encoder), ('background', self.background)):
             if isinstance(ui.get(key), int): widget.setCurrentIndex(ui[key])
         for key, widget in (('manual_pick', self.manual_pick), ('ai_desc', self.ai_desc), ('hook', self.hook),
-                            ('punch', self.punch), ('srt', self.srt), ('speaker_crop', self.speaker_crop)):
+                            ('punch', self.punch), ('srt', self.srt), ('speaker_crop', self.speaker_crop),
+                            ('soft_follow', self.soft_follow)):
             if key in ui: widget.setChecked(bool(ui[key]))
         st = ui.get('subtitles') or {}
         if st.get('preset') in SUB_PRESETS: self.sub_preset.setCurrentText(st['preset'])
@@ -516,7 +524,8 @@ class MainWindow(QMainWindow):
                     'encoder': self.encoder.currentIndex(), 'background': self.background.currentIndex(),
                     'manual_pick': self.manual_pick.isChecked(), 'ai_desc': self.ai_desc.isChecked(), 'hook': self.hook.isChecked(),
                     'punch': self.punch.isChecked(), 'srt': self.srt.isChecked(), 'subtitles': self.subtitle_style(),
-                    'speaker_crop': self.speaker_crop.isChecked(), 'preview_speaker': self.design_preview.speaker.isChecked(),
+                    'speaker_crop': self.speaker_crop.isChecked(), 'soft_follow': self.soft_follow.isChecked(),
+                    'preview_speaker': self.design_preview.speaker.isChecked(),
                     'out_dir': self.out_edit.text().strip(), 'banner': self.banner}}
         # Write to a temp file and swap: a crash mid-write can never leave a broken settings file.
         target = Path.home() / '.cloudy_clip_studio.json'; tmp = target.with_suffix('.json.tmp')

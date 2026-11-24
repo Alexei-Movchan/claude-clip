@@ -201,3 +201,68 @@ def analyze_active_speaker(path: str, clip_start: float, clip_end: float,
     return {'keyframes': keyframes, 'enabled': True,
             'reason': f'Кадр следует за говорящим (детектор {detector_name}, лиц: {len(tracks)}, переключений: {switches})',
             'track_count': len(tracks), 'switches': switches, 'crop_width': crop_w}
+
+
+def soft_follow_keyframes(path: str, clip_start: float, clip_end: float, sample_fps: float = 2.0,
+                          progress=None) -> dict[str, Any]:
+    """Slow, gentle camera that keeps the main face in view of an enlarged (zoomed) picture.
+
+    Returns keyframes [(t relative to clip start, face center x in source pixels)] — one point
+    per changed position, heavily smoothed, so the frame drifts instead of jumping.
+    """
+    try:
+        import cv2
+        import numpy as np
+    except Exception:
+        return {'keyframes': [], 'enabled': False, 'reason': 'OpenCV недоступен'}
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return {'keyframes': [], 'enabled': False, 'reason': 'Не удалось открыть видео'}
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0); height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    if not width or not height or width / height <= 9 / 16:
+        cap.release(); return {'keyframes': [], 'enabled': False, 'reason': 'Исходник уже вертикальный'}
+    scale = min(1.0, 960 / width)
+    name, detect = _make_detector(cv2, width, height, scale)
+    if detect is None:
+        cap.release(); return {'keyframes': [], 'enabled': False, 'reason': 'Не найдена модель лиц'}
+    duration = max(0.1, clip_end - clip_start)
+    step = max(1, int(round(fps / sample_fps)))
+    frame_no = int(max(0.0, clip_start) * fps); end_frame = int(clip_end * fps)
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+    samples: list[tuple[float, float]] = []   # (t, x of the biggest face)
+    k = 0
+    while frame_no < end_frame:
+        if k % step:
+            if not cap.grab(): break
+            frame_no += 1; k += 1; continue
+        ok, frame = cap.read()
+        if not ok: break
+        t = frame_no / fps - clip_start; frame_no += 1; k += 1
+        if progress: progress(max(0.0, min(1.0, t / duration)))
+        small = cv2.resize(frame, (max(1, int(width * scale)), max(1, int(height * scale)))) if scale != 1.0 else frame
+        faces = detect(small)
+        if faces:
+            fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])[:4]
+            samples.append((t, (fx + fw / 2) / scale))
+    cap.release()
+    if len(samples) < 3:
+        return {'keyframes': [], 'enabled': False, 'reason': 'Лица почти не видны — кадр по центру'}
+    # One value per second (median), gaps keep the previous position, then a 5-second moving average.
+    secs = int(duration) + 1
+    per_sec: list[float | None] = [None] * secs
+    for s in range(secs):
+        xs = [x for t, x in samples if s - 0.5 <= t < s + 1.5]
+        if xs: per_sec[s] = float(np.median(xs))
+    first = next(v for v in per_sec if v is not None)
+    filled, last = [], first
+    for v in per_sec:
+        last = v if v is not None else last; filled.append(last)
+    smooth = [float(np.mean(filled[max(0, i - 2):i + 3])) for i in range(secs)]
+    dead = width * 0.03   # ignore drifts smaller than 3% of the width
+    keyframes = [(0.0, smooth[0])]
+    for s in range(1, secs):
+        if abs(smooth[s] - keyframes[-1][1]) > dead: keyframes.append((float(s), smooth[s]))
+    keyframes.append((duration, keyframes[-1][1]))
+    return {'keyframes': keyframes[:200], 'enabled': True,
+            'reason': f'Мягкое слежение за лицом (детектор {name})', 'mode': 'follow'}

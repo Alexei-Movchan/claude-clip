@@ -328,6 +328,22 @@ def _strip_model_output(raw: str) -> str:
     return raw
 
 
+def _salvage_objects(text: str, key: str = 'start_id') -> list[dict]:
+    """Pull every complete {...} object containing `key` out of a cut-off JSON answer."""
+    dec = json.JSONDecoder(); out, i = [], 0
+    while True:
+        j = text.find('{', i)
+        if j < 0: break
+        try:
+            obj, end = dec.raw_decode(text, j)
+            if isinstance(obj, dict) and key in obj:
+                out.append(obj); i = end; continue
+        except ValueError:
+            pass
+        i = j + 1
+    return out
+
+
 def _extract_clip_list(parsed: Any) -> list:
     """Models answer with {"clips": [...]}, {"fragments": [...]}, a bare list, or a single object."""
     if isinstance(parsed, list): return parsed
@@ -441,13 +457,18 @@ def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: s
             'Фрагмент должен начинаться с начала мысли и заканчиваться законченной мыслью, быть понятным без остального видео.\n'
             'Ищи законченные истории, юмор, эмоции, неожиданные повороты, сильные мысли и интригу. Фрагменты не должны пересекаться.\n'
             'Верни JSON: {"clips": [{"start_id": 0, "end_id": 0, "title": "короткое название", '
-            '"hook": "дословная цепляющая фраза из фрагмента", "score": 1-100, "reason": "почему это интересно"}]}\n\n'
+            '"hook": "дословная цепляющая фраза из фрагмента", "score": 1-100, "reason": "почему это интересно"}]}\n'
+            'Пиши компактно, без отступов и переносов строк: title — до 8 слов, hook — до 12 слов, reason — до 15 слов.\n\n'
             'Фразы:\n' + lines)
         try:
             tokens_note = (lambda k, n=n: notice_callback(f'Локальный AI: часть {n}/{len(chunks)} · ответ модели: {k} токенов')) \
                 if notice_callback else None
-            raw = _strip_model_output(_ollama_chat(base_url, model, prompt, on_tokens=tokens_note, cancel=cancel))
-            items = _extract_clip_list(json.loads(raw))
+            raw = _strip_model_output(_ollama_chat(base_url, model, prompt, max_tokens=4000, on_tokens=tokens_note, cancel=cancel))
+            try:
+                items = _extract_clip_list(json.loads(raw))
+            except ValueError:
+                items = _salvage_objects(raw)   # answer was cut off: keep every fully written clip
+                if not items: raise
         except Cancelled:
             raise
         except Exception as exc:
@@ -695,7 +716,23 @@ def _zoom_expression(punches: list[float], amount: float = 0.12) -> str:
 
 # --------------------------------------------------------------------------- render
 
-def _framing(head: str, info: dict, crop_x_expr: str | None, zoom: float, background: str) -> str:
+def _scaled_width(info: dict, zoom: float) -> int:
+    """Width of the enlarged picture inside the 1080-wide frame (same formula as the scale filter)."""
+    z = max(1.0, min(3.0, float(zoom)))
+    s = min(OUT_W * z / max(1, info['width']), OUT_H / max(1, info['height']))
+    return int(s * info['width'] / 2) * 2
+
+
+def follow_expression(keyframes: list[tuple[float, float]], info: dict, zoom: float) -> str | None:
+    """Gentle pan: x of the 1080-wide window over the enlarged picture, following the face center."""
+    sw = _scaled_width(info, zoom)
+    if sw <= OUT_W or not keyframes: return None
+    k = sw / max(1, info['width'])
+    return _crop_expression([(t, x * k) for t, x in keyframes], OUT_W, sw)
+
+
+def _framing(head: str, info: dict, crop_x_expr: str | None, zoom: float, background: str,
+             follow_x_expr: str | None = None) -> str:
     """Filter chain that turns the source picture into a 1080x1920 frame, ending in label [fr].
 
     crop_x_expr: speaker-tracking crop (x of the 9:16 window, may depend on t); None = fit with zoom.
@@ -706,8 +743,9 @@ def _framing(head: str, info: dict, crop_x_expr: str | None, zoom: float, backgr
         return f"{head},crop={crop_w}:{info['height'] // 2 * 2}:'{crop_x_expr}':0,scale={OUT_W}:{OUT_H},setsar=1[fr]"
     # zoom > 1 enlarges a landscape picture: sides are cropped a little, the bars shrink.
     z = max(1.0, min(3.0, float(zoom)))
+    x_part = f":'{follow_x_expr}':'(ih-oh)/2'" if follow_x_expr else ''
     fg = (f"scale=w='trunc(min({OUT_W * z:.1f}/iw\\,{OUT_H}/ih)*iw/2)*2':h=-2,"
-          f"crop='min(iw\\,{OUT_W})':'min(ih\\,{OUT_H})'")
+          f"crop='min(iw\\,{OUT_W})':'min(ih\\,{OUT_H})'{x_part}")
     if background == 'blur':
         # Blurred, darkened copy of the same picture fills the bars (cheap: blurred at 1/4 size).
         return (f"{head},split=2[fgsrc][bgsrc];"
@@ -722,7 +760,8 @@ SAMPLE_CAPTION = ['Так', 'будут', 'выглядеть', 'субтитр�
 
 def render_preview_frame(source: str, t: float, out_png: str, words: list[dict] | None = None,
                          zoom: float = 1.3, background: str = 'blur', subtitle_style: dict | None = None,
-                         crop_center_x: float | None = None, info: dict | None = None) -> str:
+                         crop_center_x: float | None = None, info: dict | None = None,
+                         follow_center_x: float | None = None) -> str:
     """One finished-looking 1080x1920 frame at source time t (framing + background + captions).
 
     words: real transcript words (captions of that moment are shown, current word highlighted);
@@ -749,7 +788,8 @@ def render_preview_frame(source: str, t: float, out_png: str, words: list[dict] 
         if crop_center_x is not None and info['width'] / max(1, info['height']) > 9 / 16:
             crop_w = max(2, int(info['height'] * 9 / 16) // 2 * 2)
             expr = f'{max(0.0, min(float(crop_center_x) - crop_w / 2, info["width"] - crop_w)):.1f}'
-        graph = _framing('[0:v]setpts=PTS-STARTPTS', info, expr, zoom, background)
+        fexpr = follow_expression([(0.0, follow_center_x)], info, zoom) if follow_center_x is not None and expr is None else None
+        graph = _framing('[0:v]setpts=PTS-STARTPTS', info, expr, zoom, background, fexpr)
         graph += f";[fr]ass='{_ffmpeg_filter_path(ass)}'[v]"
         run([ffmpeg_path(), '-y', '-ss', f'{t:.3f}', '-i', source, '-filter_complex', graph, '-map', '[v]',
              '-frames:v', '1', out_png])
@@ -759,7 +799,8 @@ def render_preview_frame(source: str, t: float, out_png: str, words: list[dict] 
 def _render_base(source: str, out: str, clip_start: float, clip_dur: float, keep: list[tuple[float, float]],
                  crop_keyframes: list[tuple[float, float]] | None, info: dict, zoom: float = 1.0,
                  background: str = 'blur', punches: list[float] | None = None,
-                 progress: Callable[[float], None] | None = None) -> None:
+                 progress: Callable[[float], None] | None = None,
+                 follow_keyframes: list[tuple[float, float]] | None = None) -> None:
     """One encode: cut the clip, drop long pauses, frame it as 9:16, normalise A/V format.
 
     Uses select/aselect on a single decoded stream (no split buffering). Audio is
@@ -772,7 +813,8 @@ def _render_base(source: str, out: str, clip_start: float, clip_dur: float, keep
     expr = None
     if crop_keyframes and info['width'] / max(1, info['height']) > 9 / 16:
         expr = _crop_expression(crop_keyframes, max(2, int(info['height'] * 9 / 16) // 2 * 2), info['width'])
-    video = _framing(head, info, expr, zoom, background)
+    fexpr = follow_expression(follow_keyframes, info, zoom) if follow_keyframes and expr is None else None
+    video = _framing(head, info, expr, zoom, background, fexpr)
     if punches:
         video += (f";[fr]zoompan=z='{_zoom_expression(punches)}':d=1:x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':"
                   f"s={OUT_W}x{OUT_H}:fps={FPS},format=yuv420p[v]")
@@ -881,9 +923,13 @@ def render_clip(source: str, banner: str, clip: dict, words: list[dict], output:
         clip_words = [w for w in words if float(w['end']) > start and float(w['start']) < end]
         word_times = [(mapper(float(w['start']) - start), mapper(float(w['end']) - start)) for w in clip_words]
 
-        crop_kf = (speaker_data or {}).get('keyframes') or None
+        sd = speaker_data or {}
+        crop_kf = sd.get('keyframes') if sd.get('mode') != 'follow' else None
+        follow_kf = sd.get('keyframes') if sd.get('mode') == 'follow' else None
         if crop_kf:
             crop_kf = [(mapper(float(t)), x) for t, x in crop_kf]
+        if follow_kf:
+            follow_kf = [(mapper(float(t)), x) for t, x in follow_kf]
 
         punches: list[float] = []
         if opt['punch_ins'] and clip_words:
@@ -896,7 +942,7 @@ def render_clip(source: str, banner: str, clip: dict, words: list[dict], output:
         report(0.02)
         # The first pass is the heavier one (decode + framing + blur), ~60% of the time.
         _render_base(source, base, start, end - start, keep, crop_kf, info, zoom, opt['background'], punches,
-                     progress=lambda f: report(0.03 + 0.57 * f))
+                     progress=lambda f: report(0.03 + 0.57 * f), follow_keyframes=follow_kf)
         base_dur = probe(base)['duration'] or base_dur
 
         hook_range, hook_words = None, []

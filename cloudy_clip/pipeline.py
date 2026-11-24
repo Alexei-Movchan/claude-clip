@@ -4,7 +4,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Signal, Slot
 from .media import (probe, transcribe, ai_select, ai_metadata, render_clip, safe_name, scan_render_quality,
                     set_encoder, HOOK_MAX)
-from .speaker import analyze_active_speaker
+from .speaker import analyze_active_speaker, soft_follow_keyframes
 
 AD_LINE = 'Лучший VPN с обходом 👇 Ищи в Telegram: @cloudy\n#cloudyvpn'
 
@@ -166,15 +166,26 @@ class RenderWorker(QObject):
                     if not clip.get('hook') and meta.get('hook'): clip['hook'] = meta['hook']
                 title = safe_name(clip.get('title') or f'Clip_{i:02}')
                 out = Path(self.out_dir, f'Clip_{i:02}_{title}.mp4')
-                if self.settings.get('speaker_crop', True):
+                crop_on = self.settings.get('speaker_crop', True)
+                follow_on = self.settings.get('soft_follow', True) and float(self.settings.get('zoom', 1.3)) > 1.0
+                speaker_data = {'keyframes': [], 'enabled': False, 'reason': 'Весь кадр с фоном, по центру'}
+                if crop_on:
                     step(0.03, f'Анализ говорящего {i}/{n}')
                     try:
                         speaker_data = analyze_active_speaker(self.source, float(clip['start']), float(clip['end']), words,
-                                                              progress=lambda f: step(0.03 + 0.2 * f))
+                                                              progress=lambda f: step(0.03 + (0.1 if follow_on else 0.2) * f))
                     except Exception as speaker_error:
                         speaker_data = {'keyframes': [], 'enabled': False, 'reason': f'Резервное кадрирование: {str(speaker_error)[:120]}'}
-                else:
-                    speaker_data = {'keyframes': [], 'enabled': False, 'reason': 'Выключено в настройках: весь кадр с фоном'}
+                if follow_on and not speaker_data.get('keyframes'):
+                    # No confident full-screen crop: gently pan the enlarged picture after the face instead.
+                    step(0.13 if crop_on else 0.03, f'Слежение за лицом {i}/{n}')
+                    try:
+                        follow = soft_follow_keyframes(self.source, float(clip['start']), float(clip['end']),
+                                                       progress=lambda f: step((0.13 if crop_on else 0.03) + (0.1 if crop_on else 0.2) * f))
+                        if follow.get('keyframes'): speaker_data = follow
+                        else: speaker_data['reason'] = follow.get('reason', speaker_data['reason'])
+                    except Exception:
+                        pass
                 step(0.23, f"Монтаж {i}/{n}: {clip.get('title') or title}")
                 banner_data = render_clip(self.source, self.banner, clip, words, str(out), 1.0, speaker_data=speaker_data,
                                           zoom=float(self.settings.get('zoom', 1.3)),
