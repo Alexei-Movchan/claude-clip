@@ -359,12 +359,40 @@ def pause_kind(scenes: dict | None, a: float, b: float) -> str:
     return 'still'
 
 
+ACTION_MAX = 45.0      # at most this much silent action is kept from one pause
+ACTION_PAD = 0.5       # seconds kept around detected movement
+
+
+def action_spans(scenes: dict | None, a: float, b: float) -> list[tuple[float, float]]:
+    """Parts of a speech pause (absolute seconds) in which something happens on screen: movement or cuts.
+    Title cards (mostly dark and still) give none. Still stretches between them are not included."""
+    if not scenes or not scenes.get('score') or b - a <= 0: return []
+    if pause_kind(scenes, a, b) == 'title': return []
+    f = scenes.get('fps', SCENE_FPS)
+    act = max(ACTION_MIN, ACTION_X * _baseline(scenes))
+    sc, lu = scenes['score'], scenes['luma']
+    spans: list[list[float]] = []
+    for i in range(max(0, int(a * f)), min(len(sc), int(b * f) + 1)):
+        moving = sc[i] >= act or sc[i] > SCENE_CUT
+        if moving and lu[i] >= 20:   # movement on a black screen is noise
+            t0, t1 = max(a, i / f - ACTION_PAD), min(b, (i + 1) / f + ACTION_PAD)
+            if spans and t0 <= spans[-1][1] + 0.6: spans[-1][1] = max(spans[-1][1], t1)
+            else: spans.append([t0, t1])
+    out, total = [], 0.0
+    for x, y in spans:
+        if y - x < 0.75: continue
+        y = min(y, x + ACTION_MAX - total)
+        if y - x <= 0: break
+        out.append((x, y)); total += y - x
+    return out
+
+
 # --------------------------------------------------------------------------- sentences & clip selection
 
 _SENT_END = ('.', '!', '?', '…')
 
 
-def build_sentences(words: list[dict], max_pause: float = 0.8, max_words: int = 40) -> list[dict]:
+def build_sentences(words: list[dict], max_pause: float = 0.8, max_words: int = 40, scenes: dict | None = None) -> list[dict]:
     """Group Whisper words into phrases: punctuation, a pause, or a length limit ends a phrase."""
     sents, cur = [], []
 
@@ -387,7 +415,9 @@ def build_sentences(words: list[dict], max_pause: float = 0.8, max_words: int = 
     for k, s in enumerate(sents):
         if k:
             gap = s['start'] - sents[k - 1]['end']
-            if gap > PAUSE_CUT: cum += gap - PAUSE_KEEP
+            if gap > PAUSE_CUT:
+                kept = sum(y - x for x, y in action_spans(scenes, sents[k - 1]['end'], s['start'])) if scenes else 0.0
+                cum += max(0.0, gap - PAUSE_KEEP - kept)   # silent action stays in the clip, so it counts
         s['id'] = k; s['cum'] = cum
     return sents
 
@@ -484,7 +514,7 @@ def fallback_clips(words: list[dict], target_min: float = 90, target_max: float 
     ranges already used by AI-picked clips, which candidates must not overlap.
     """
     import bisect
-    sents = annotate_boundaries(build_sentences(words), scenes)
+    sents = annotate_boundaries(build_sentences(words, scenes=scenes), scenes)
     if not sents: return []
     taken = taken or []
     goals = sorted({target_min + 8, (target_min + target_max) / 2})
@@ -696,7 +726,7 @@ def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: s
     if not words: return []
     if not use_local_ai:
         return fallback_clips(words, target_min, target_max, scenes=scenes)
-    sents = annotate_boundaries(build_sentences(words), scenes)
+    sents = annotate_boundaries(build_sentences(words, scenes=scenes), scenes)
     errors, chosen, log = [], [], []
     chunks = _sentence_chunks(sents, max_tokens=4500, overlap_seconds=target_max * 0.6)
 
@@ -839,7 +869,6 @@ def ai_metadata(transcript: str, base_url: str = 'http://127.0.0.1:11434', model
 
 # --------------------------------------------------------------------------- render helpers
 
-ACTION_KEEP = 2.5      # seconds of a silent-but-moving moment that stay in the clip
 
 
 def plan_keep_ranges(words: list[dict], clip_start: float, clip_end: float, keep_pause: float = 0.5,
@@ -859,9 +888,15 @@ def plan_keep_ranges(words: list[dict], clip_start: float, clip_end: float, keep
     for (_, prev_end), (next_start, _) in zip(local, local[1:]):
         if next_start - prev_end > cut_threshold:
             left, right = prev_end + keep_pause / 2, next_start - keep_pause / 2
-            if scenes and pause_kind(scenes, clip_start + prev_end, clip_start + next_start) == 'action':
-                if next_start - prev_end <= ACTION_KEEP + keep_pause: continue   # short action: keep it whole
-                left = prev_end + ACTION_KEEP                                     # keep the first seconds of action
+            spans = action_spans(scenes, clip_start + prev_end, clip_start + next_start) if scenes else []
+            if spans:   # keep every moment with movement, cut only the still stretches between/around them
+                pos = left
+                for x, y in spans:
+                    x, y = x - clip_start, y - clip_start
+                    if x - pos > 0.25: cuts.append((pos, x))
+                    pos = max(pos, y)
+                if right - pos > 0.25: cuts.append((pos, right))
+                continue
             if right - left > 0.25: cuts.append((left, right))
     merged: list[tuple[float, float]] = []
     for a, b in cuts:
