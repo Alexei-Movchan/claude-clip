@@ -69,7 +69,11 @@ set "STAGING=%~3"
 set "APP_PID=%~4"
 set "DEPS=%~5"
 set "GPUDEPS=%~6"
-echo Updating Cloudy Clip Studio. Please wait...
+echo ==========================================================
+echo   Updating Cloudy Clip Studio.
+echo   DO NOT CLOSE THIS WINDOW - it will close by itself and
+echo   the program will start again in a few seconds.
+echo ==========================================================
 :waitloop
 tasklist /FI "PID eq %APP_PID%" 2>nul | find "%APP_PID%" >nul
 if not errorlevel 1 (
