@@ -300,18 +300,36 @@ def build_sentences(words: list[dict], max_pause: float = 0.8, max_words: int = 
         if w['word'].strip().endswith(_SENT_END) or len(cur) >= max_words:
             flush()
     flush()
-    for k, s in enumerate(sents): s['id'] = k
+    # 'cum' = seconds of silence the montage will cut before this phrase (gaps > 1.2 s shrink to 0.5 s),
+    # so clip length can be measured as it will really play, not with long pauses included.
+    cum = 0.0
+    for k, s in enumerate(sents):
+        if k:
+            gap = s['start'] - sents[k - 1]['end']
+            if gap > PAUSE_CUT: cum += gap - PAUSE_KEEP
+        s['id'] = k; s['cum'] = cum
     return sents
+
+
+PAUSE_CUT, PAUSE_KEEP = 1.2, 0.5      # the same numbers plan_keep_ranges uses
+WALL_LIMIT = 5.0                      # a clip may span at most 5× its target length of real time
+
+
+def clip_length(sents: list[dict], s: int, e: int) -> float:
+    """Length of phrases s..e as it will play after long pauses are cut."""
+    return (sents[e]['end'] - sents[s]['start']) - (sents[e]['cum'] - sents[s]['cum'])
 
 
 def fit_to_sentences(sents: list[dict], s: int, e: int, tmin: float, tmax: float) -> tuple[int, int] | None:
     """Move clip borders by whole phrases until the duration fits [tmin, tmax]."""
     s = max(0, min(s, len(sents) - 1)); e = max(s, min(e, len(sents) - 1))
-    dur = lambda: sents[e]['end'] - sents[s]['start']
+    dur = lambda: clip_length(sents, s, e)
+    wall = lambda: sents[e]['end'] - sents[s]['start']
     while dur() < tmin:
         if e + 1 < len(sents): e += 1
         elif s > 0: s -= 1
         else: return None
+        if wall() > tmax * WALL_LIMIT: return None
     while dur() > tmax and e > s:
         e -= 1
     if not (tmin <= dur() <= tmax):
@@ -360,7 +378,7 @@ def fallback_clips(words: list[dict], target_min: float = 90, target_max: float 
         if not natural: continue
         for goal in goals:
             j = i
-            while j + 1 < len(sents) and sents[j + 1]['end'] - s['start'] <= goal: j += 1
+            while j + 1 < len(sents) and clip_length(sents, i, j + 1) <= goal: j += 1
             fit = fit_to_sentences(sents, i, j, target_min, target_max)
             if not fit or fit in seen: continue
             seen.add(fit); a, b = fit
@@ -497,7 +515,7 @@ def fit_centered(sents: list[dict], s: int, e: int, tmin: float, tmax: float) ->
     """Like fit_to_sentences, but grows a too-short range on BOTH sides around the moment the model chose,
     so neighbouring short picks do not all swell forward into each other."""
     s = max(0, min(s, len(sents) - 1)); e = max(s, min(e, len(sents) - 1))
-    dur = lambda: sents[e]['end'] - sents[s]['start']
+    dur = lambda: clip_length(sents, s, e)
     turn = 0
     while dur() < tmin:
         if (turn % 2 == 0 and e + 1 < len(sents)) or s == 0:
@@ -506,6 +524,7 @@ def fit_centered(sents: list[dict], s: int, e: int, tmin: float, tmax: float) ->
         else:
             s -= 1
         turn += 1
+        if sents[e]['end'] - sents[s]['start'] > tmax * WALL_LIMIT: return None
     while dur() > tmax and e > s:
         e -= 1
     return (s, e) if tmin <= dur() <= tmax else None
@@ -600,8 +619,8 @@ def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: s
             except OSError: pass
     for n, chunk in enumerate(chunks, 1):
         if notice_callback: notice_callback(f'Локальный AI: часть {n}/{len(chunks)}')
-        span = chunk[-1]['end'] - chunk[0]['start']
-        want_min = max(1, min(4, round(span / 150)))      # about one clip per 2.5 minutes
+        speech = clip_length(sents, chunk[0]['id'], chunk[-1]['id'])
+        want_min = max(1, min(4, int(speech / 130)))      # as many clips as the speech in this part can fill
         accepted_here = []
         for attempt in (1, 2):
             exclude = [(a, b) for a, b, _ in accepted_here]
@@ -620,14 +639,23 @@ def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: s
                 if not fit: nofit += 1; continue
                 a, b = fit
                 cand = {'start': sents[a]['start'], 'end': sents[b]['end']}
-                if any(_overlap_ratio(cand, x) >= 0.3 for x in chosen): overl += 1; continue
+                hits = [x for x in chosen if _overlap_ratio(cand, x) >= 0.3]
+                if hits:   # try the free space right after the clip(s) it runs into
+                    after = max(x['end'] for x in hits)
+                    s2 = next((k for k in range(a, min(len(sents), b + 40)) if sents[k]['start'] >= after), None)
+                    fit2 = fit_to_sentences(sents, s2, max(s2, e_id), target_min, target_max) if s2 is not None else None
+                    if fit2:
+                        a, b = fit2; cand = {'start': sents[a]['start'], 'end': sents[b]['end']}
+                    if not fit2 or any(_overlap_ratio(cand, x) >= 0.3 for x in chosen):
+                        overl += 1; continue
                 try: score = max(1.0, min(100.0, float(c.get('score', 50))))
                 except (TypeError, ValueError): score = 50.0
                 clip = {**cand, 'title': str(c.get('title') or '').strip(), 'hook': str(c.get('hook') or '').strip(),
                         'score': score, 'reason': str(c.get('reason') or '').strip(),
                         'transcript': ' '.join(x['text'] for x in sents[a:b + 1])}
                 chosen.append(clip); accepted_here.append((a, b, clip)); added += 1
-            log.append(f'часть {n} ({_fmt_min(chunk[0]["start"])}–{_fmt_min(chunk[-1]["end"])}), попытка {attempt}: '
+            speech = clip_length(sents, chunk[0]['id'], chunk[-1]['id'])
+            log.append(f'часть {n} ({_fmt_min(chunk[0]["start"])}–{_fmt_min(chunk[-1]["end"])}, речи {speech / 60:.1f} мин), попытка {attempt}: '
                        f'предложено {len(items)}, принято {added}, пересеклись {overl}, не подошла длина {nofit}'
                        + (f', непонятные номера: {len(problems)}' if problems else ''))
             if len(accepted_here) >= want_min: break
