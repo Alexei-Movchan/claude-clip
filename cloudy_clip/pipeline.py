@@ -14,6 +14,35 @@ def output_dir_for(root: str, source: str) -> str:
     return str(Path(root) / safe_name(Path(source).stem))
 
 
+DATA_DIR = '.cloudy'
+SERVICE_FILES = ('transcript_cache.json', 'transcript.txt', 'clips_manifest.json')
+
+
+def data_dir_for(out_dir: str | Path) -> Path:
+    """Hidden subfolder for service files, so the output folder holds only the clips."""
+    d = Path(out_dir) / DATA_DIR
+    d.mkdir(parents=True, exist_ok=True)
+    if os.name == 'nt':
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetFileAttributesW(str(d), 0x02)  # FILE_ATTRIBUTE_HIDDEN
+        except Exception:
+            pass
+    for name in SERVICE_FILES + tuple(p.name for p in Path(out_dir).glob('ai_answer_part*.txt')):  # tidy older versions
+        old = Path(out_dir) / name
+        if old.exists():
+            try: os.replace(old, d / name)
+            except OSError: pass
+    return d
+
+
+def next_clip_number(out_dir: str | Path) -> int:
+    """Continue numbering after clips from earlier runs instead of starting at Clip_01 again."""
+    import re
+    nums = [int(m.group(1)) for p in Path(out_dir).glob('Clip_*.mp4') if (m := re.match(r'Clip_(\d+)_', p.name))]
+    return max(nums, default=0) + 1
+
+
 def target_max_seconds(ad_duration: float, hook: bool) -> int:
     # Final clip = [hook] + speech + ad breaks ≤ 150 s (two breaks for clips ≥ 2:00).
     return int(150 - 2 * ad_duration - (HOOK_MAX if hook else 0))
@@ -49,7 +78,7 @@ class AnalyzeWorker(QObject):
         """Re-running the same video skips Whisper (the slowest step)."""
         st = os.stat(self.source)
         key = {'source': os.path.abspath(self.source), 'size': st.st_size, 'mtime': int(st.st_mtime), 'model': model}
-        cache = Path(self.out_dir, 'transcript_cache.json')
+        cache = data_dir_for(self.out_dir) / 'transcript_cache.json'
         if cache.exists():
             try:
                 data = json.loads(cache.read_text(encoding='utf-8'))
@@ -83,9 +112,9 @@ class AnalyzeWorker(QObject):
                     progress_callback=on_whisper,
                     notice_callback=lambda msg: self.progress.emit(10, msg))
                 if not words: raise RuntimeError('Речь не распознана. Проверьте звук исходного видео.')
-                Path(self.out_dir, 'transcript_cache.json').write_text(
+                (data_dir_for(self.out_dir) / 'transcript_cache.json').write_text(
                     json.dumps({'key': key, 'words': words, 'transcript': transcript}, ensure_ascii=False), encoding='utf-8')
-            Path(self.out_dir, 'transcript.txt').write_text(transcript, encoding='utf-8')
+            (data_dir_for(self.out_dir) / 'transcript.txt').write_text(transcript, encoding='utf-8')
             if self._cancel: raise RuntimeError('Обработка остановлена')
             self.eta.emit(-1.0)
             self.progress.emit(38, 'Поиск лучших моментов (локальный AI)')
@@ -98,7 +127,7 @@ class AnalyzeWorker(QObject):
                               model=self.settings.get('local_model', 'qwen3:4b'), target_min=90, target_max=target_max,
                               use_local_ai=True, notice_callback=lambda msg: self.progress.emit(40, msg),
                               cancel=lambda: self._cancel, fill=self.settings.get('fill_clips', True),
-                              debug_dir=self.out_dir)
+                              debug_dir=str(data_dir_for(self.out_dir)))
             if not clips: raise RuntimeError('Не удалось найти фрагменты нужной продолжительности. Попробуйте более длинное видео.')
             # Trim long silent openings/endings when enough speech remains.
             speech_clips = []
@@ -144,6 +173,7 @@ class RenderWorker(QObject):
                        'subtitle_style': self.settings.get('subtitle_style')}
             results = []
             n = len(clips)
+            first_no = next_clip_number(self.out_dir)
             eta = Eta()
             for i, clip in enumerate(clips, 1):
                 if self._cancel: break
@@ -166,7 +196,7 @@ class RenderWorker(QObject):
                     clip['title'] = meta['title'] or clip.get('title', '')
                     if not clip.get('hook') and meta.get('hook'): clip['hook'] = meta['hook']
                 title = safe_name(clip.get('title') or f'Clip_{i:02}')
-                out = Path(self.out_dir, f'Clip_{i:02}_{title}.mp4')
+                out = Path(self.out_dir, f'Clip_{first_no + i - 1:02}_{title}.mp4')
                 crop_on = self.settings.get('speaker_crop', True)
                 follow_on = self.settings.get('soft_follow', True) and float(self.settings.get('zoom', 1.3)) > 1.0
                 speaker_data = {'keyframes': [], 'enabled': False, 'reason': 'Весь кадр с фоном, по центру'}
@@ -211,9 +241,11 @@ class RenderWorker(QObject):
                 else:
                     parts = [clip.get('title') or '', clip.get('hook') or 'Интересный момент из видео.']
                 description = '\n\n'.join(p for p in parts if p) + '\n\n' + AD_LINE
-                desc = out.with_suffix('.txt'); desc.write_text(description, encoding='utf-8')
+                desc = out.with_suffix('.txt')
+                if self.settings.get('save_txt', False): desc.write_text(description, encoding='utf-8')
                 srt = out.with_suffix('.srt')
-                report = {'file': str(out), 'description_file': str(desc), 'srt_file': str(srt) if srt.exists() else '',
+                report = {'file': str(out), 'description': description,
+                          'description_file': str(desc) if desc.exists() else '', 'srt_file': str(srt) if srt.exists() else '',
                           'title': clip.get('title', ''), 'start': clip['start'], 'end': clip['end'], 'score': clip.get('score', 0),
                           'reason': clip.get('reason', ''), 'hook': clip.get('hook', ''), 'speaker_tracking': speaker_data,
                           'banner': banner_data, 'quality_scan': quality_scan, 'quality_checks': checks,
@@ -223,7 +255,7 @@ class RenderWorker(QObject):
                                                if not banner_data.get('banner_area_passed', False) else []) + quality_scan.get('warnings', [])}
                 results.append(report)
                 step(1.0, f'Готово {i}/{n}')
-            manifest = Path(self.out_dir, 'clips_manifest.json')
+            manifest = data_dir_for(self.out_dir) / 'clips_manifest.json'
             old = []
             if manifest.exists():
                 try: old = [r for r in json.loads(manifest.read_text(encoding='utf-8')) if r.get('file') not in {x['file'] for x in results}]

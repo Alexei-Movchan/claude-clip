@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
     QTabWidget, QFormLayout, QComboBox, QGroupBox, QTextEdit, QSplitter, QCheckBox, QSpinBox, QFontComboBox,
     QScrollArea, QFrame, QSystemTrayIcon, QStyle, QProgressDialog, QSlider, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView)
-from .pipeline import AnalyzeWorker, RenderWorker, output_dir_for
+from .pipeline import AnalyzeWorker, RenderWorker, output_dir_for, data_dir_for
 from .media import (ffmpeg_available, probe, render_preview_frame, build_sentences, which, NO_WINDOW,
                     SUB_PRESETS, SUB_POSITIONS, ACTIVE_COLORS)
 from .updater import (APP_VERSION, DEFAULT_OWNER, DEFAULT_REPO, check_release, download_and_stage, is_newer,
@@ -475,6 +475,7 @@ class MainWindow(QMainWindow):
         self.sub_color = QComboBox(); self.sub_color.addItems(list(ACTIVE_COLORS)); sf.addRow('Цвет текущего слова', self.sub_color)
         self.sub_upper = QCheckBox('ЗАГЛАВНЫМИ БУКВАМИ'); sf.addRow(self.sub_upper)
         self.srt = QCheckBox('Сохранять субтитры отдельным файлом .srt (для загрузки на площадку)'); self.srt.setChecked(True); sf.addRow(self.srt)
+        self.save_txt = QCheckBox('Сохранять описание ролика отдельным файлом .txt рядом с роликом'); self.save_txt.setChecked(False); sf.addRow(self.save_txt)
         lay.addWidget(subs); lay.addStretch()
         self.apply_preset(self.sub_preset.currentText())
         page = QWidget(); h = QHBoxLayout(page); h.setContentsMargins(0, 0, 0, 0)
@@ -524,7 +525,7 @@ class MainWindow(QMainWindow):
         right = QWidget(); rv = QVBoxLayout(right); self.preview_title = QLabel('Готовые нарезки'); self.preview_title.setStyleSheet('font-size:18pt;font-weight:700'); self.preview_title.setWordWrap(True); rv.addWidget(self.preview_title)
         self.detail = QTextEdit(); self.detail.setReadOnly(True); rv.addWidget(self.detail, 1)
         row = QHBoxLayout()
-        for text, fn in (('Открыть видео', self.open_selected), ('Описание', self.open_description), ('Субтитры .srt', self.open_srt), ('Папка', self.open_folder)):
+        for text, fn in (('Открыть видео', self.open_selected), ('Копировать описание', self.open_description), ('Субтитры .srt', self.open_srt), ('Папка', self.open_folder)):
             b = QPushButton(text); b.clicked.connect(fn); row.addWidget(b)
         rv.addLayout(row)
         split.addWidget(right); split.setSizes([380, 650]); lay.addWidget(split); self.tabs.addTab(tab, 'Результаты')
@@ -585,7 +586,8 @@ class MainWindow(QMainWindow):
         if src == self.design_preview.source: self.design_preview.request(); return
         words = None
         try:
-            cache = Path(output_dir_for(self.out_edit.text().strip(), src)) / 'transcript_cache.json'
+            out = Path(output_dir_for(self.out_edit.text().strip(), src))
+            cache = next((p for p in (out / '.cloudy' / 'transcript_cache.json', out / 'transcript_cache.json') if p.exists()), out / 'x')
             if cache.exists(): words = json.loads(cache.read_text(encoding='utf-8')).get('words')
         except Exception:
             words = None
@@ -599,7 +601,7 @@ class MainWindow(QMainWindow):
                 'background': 'black' if self.background.currentIndex() == 1 else 'blur',
                 'hook': self.hook.isChecked(), 'punch_ins': self.punch.isChecked(), 'srt': self.srt.isChecked(),
                 'speaker_crop': self.speaker_crop.isChecked(), 'soft_follow': self.soft_follow.isChecked(),
-                'fill_clips': self.fill_clips.currentIndex() == 0,
+                'fill_clips': self.fill_clips.currentIndex() == 0, 'save_txt': self.save_txt.isChecked(),
                 'ai_descriptions': self.ai_desc.isChecked(), 'manual_pick': self.manual_pick.isChecked(),
                 'subtitle_style': self.subtitle_style()}
 
@@ -622,7 +624,7 @@ class MainWindow(QMainWindow):
             if isinstance(ui.get(key), int): widget.setCurrentIndex(ui[key])
         for key, widget in (('manual_pick', self.manual_pick), ('ai_desc', self.ai_desc), ('hook', self.hook),
                             ('punch', self.punch), ('srt', self.srt), ('speaker_crop', self.speaker_crop),
-                            ('soft_follow', self.soft_follow)):
+                            ('soft_follow', self.soft_follow), ('save_txt', self.save_txt)):
             if key in ui: widget.setChecked(bool(ui[key]))
         st = ui.get('subtitles') or {}
         if st.get('preset') in SUB_PRESETS: self.sub_preset.setCurrentText(st['preset'])
@@ -668,7 +670,7 @@ class MainWindow(QMainWindow):
              'shortcut_offered': self.shortcut_offered,
              'ui': {'whisper': self.whisper.currentText(), 'device': self.device.currentText(), 'zoom': self.zoom.currentText(),
                     'encoder': self.encoder.currentIndex(), 'background': self.background.currentIndex(),
-                    'fill_clips': self.fill_clips.currentIndex(),
+                    'fill_clips': self.fill_clips.currentIndex(), 'save_txt': self.save_txt.isChecked(),
                     'manual_pick': self.manual_pick.isChecked(), 'ai_desc': self.ai_desc.isChecked(), 'hook': self.hook.isChecked(),
                     'punch': self.punch.isChecked(), 'srt': self.srt.isChecked(), 'subtitles': self.subtitle_style(),
                     'speaker_crop': self.speaker_crop.isChecked(), 'soft_follow': self.soft_follow.isChecked(),
@@ -971,7 +973,7 @@ class MainWindow(QMainWindow):
     def _save_edited_captions(self):
         """Keep subtitle edits in the transcript cache, so re-processing this video keeps them."""
         if not getattr(self, 'captions_edited', False) or not self.analysis: return
-        cache = Path(self.analysis['out_dir']) / 'transcript_cache.json'
+        cache = data_dir_for(self.analysis['out_dir']) / 'transcript_cache.json'
         try:
             data = json.loads(cache.read_text(encoding='utf-8')) if cache.exists() else {}
             data['words'] = self.analysis['words']; data['edited'] = True
@@ -992,7 +994,8 @@ class MainWindow(QMainWindow):
         self.preview_title.setText(r.get('title') or Path(r['file']).name)
         speaker = r.get('speaker_tracking', {}); scan = r.get('quality_scan', {}); b = r['banner']
         warnings = r.get('quality_warnings', [])
-        desc = Path(r['description_file']).read_text(encoding='utf-8') if Path(r['description_file']).exists() else ''
+        desc = r.get('description') or (Path(r['description_file']).read_text(encoding='utf-8')
+                                        if r.get('description_file') and Path(r['description_file']).exists() else '')
         self.detail.setPlainText(
             f"Файл: {r['file']}\nИсходный отрезок: {_fmt(r['start'])}–{_fmt(r['end'])}\nДлительность: {b['duration']:.1f} с\n"
             f"Оценка: {r['score']:.0f}/100\nПочему выбран: {r['reason'] or '—'}\n"
@@ -1012,7 +1015,10 @@ class MainWindow(QMainWindow):
 
     def open_description(self):
         r = self._selected()
-        if r: QDesktopServices.openUrl(QUrl.fromLocalFile(r['description_file']))
+        if not r: return
+        text = r.get('description') or (Path(r['description_file']).read_text(encoding='utf-8') if r.get('description_file') else '')
+        QApplication.clipboard().setText(text)
+        self.status.setText('Описание скопировано — вставьте его на площадку (Ctrl+V).')
 
     def open_srt(self):
         r = self._selected()
