@@ -38,5 +38,5 @@
 ## Выпуск новой версии (для разработчика)
 
 1. Поднять версию в `VERSION` и `APP_VERSION` в `cloudy_clip/updater.py`, дописать `CHANGELOG.md`.
-2. `python tools/make_release.py` → `release/Cloudy_Clip_Studio_Source.zip`.
-3. Создать GitHub Release с тегом `vX.Y.Z` (не pre-release) и приложить этот zip.
+2. (Проверить локально: `python tools/make_release.py` → `release/Cloudy_Clip_Studio_Source.zip`.)
+3. Запушить в `main`: GitHub Actions (`.github/workflows/release.yml`) сам соберёт zip и опубликует релиз `vX.Y.Z`, как только изменится `VERSION`.

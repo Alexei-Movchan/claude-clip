@@ -1,0 +1,47 @@
+# Publishes a GitHub Release whenever VERSION changes on main.
+# The app's updater downloads the Cloudy_Clip_Studio_Source.zip asset from the latest release.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [VERSION, .github/workflows/release.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: v
+        run: echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Check if this version is already released
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "v${{ steps.v.outputs.version }}" > /dev/null 2>&1; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "Release v${{ steps.v.outputs.version }} already exists - nothing to do."
+          fi
+
+      - name: Build zip and notes
+        if: steps.check.outputs.exists != '1'
+        run: |
+          python3 tools/make_release.py
+          python3 tools/release_notes.py > notes.md
+
+      - name: Publish release
+        if: steps.check.outputs.exists != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.v.outputs.version }}" release/Cloudy_Clip_Studio_Source.zip \
+            --title "Cloudy Clip Studio ${{ steps.v.outputs.version }}" \
+            --notes-file notes.md --target "$GITHUB_SHA"
