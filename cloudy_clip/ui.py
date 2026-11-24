@@ -6,9 +6,11 @@ from PySide6.QtGui import QDesktopServices, QFont, QIcon, QPixmap
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QFileDialog, QProgressBar, QListWidget, QListWidgetItem, QMessageBox,
     QTabWidget, QFormLayout, QComboBox, QGroupBox, QTextEdit, QSplitter, QCheckBox, QSpinBox, QFontComboBox,
-    QScrollArea, QFrame, QSystemTrayIcon, QStyle, QProgressDialog, QSlider)
+    QScrollArea, QFrame, QSystemTrayIcon, QStyle, QProgressDialog, QSlider, QTableWidget, QTableWidgetItem,
+    QHeaderView, QAbstractItemView)
 from .pipeline import AnalyzeWorker, RenderWorker, output_dir_for
-from .media import ffmpeg_available, probe, render_preview_frame, SUB_PRESETS, SUB_POSITIONS, ACTIVE_COLORS
+from .media import (ffmpeg_available, probe, render_preview_frame, build_sentences, which, NO_WINDOW,
+                    SUB_PRESETS, SUB_POSITIONS, ACTIVE_COLORS)
 from .updater import (APP_VERSION, DEFAULT_OWNER, DEFAULT_REPO, check_release, download_and_stage, is_newer,
                       UpdateError)
 
@@ -30,7 +32,10 @@ QProgressBar::chunk {background:#6b55e8;border-radius:7px;}
 QTabWidget::pane {border:1px solid #293244;border-radius:10px;} QTabBar::tab {background:#171d29;padding:10px 18px;border-radius:7px;margin:3px;} QTabBar::tab:selected {background:#394867;}
 QCheckBox::indicator, QListWidget::indicator {width:16px;height:16px;border:1px solid #5a6a86;border-radius:4px;background:#171d29;}
 QCheckBox::indicator:checked, QListWidget::indicator:checked {background:#6b55e8;border-color:#8b78ff;}
-QListWidget::item {padding:6px;} QListWidget::item:selected {background:#2c3a55;}
+QListWidget::item {padding:6px;}
+QTableWidget {background:#171d29;border:1px solid #303b50;border-radius:8px;gridline-color:#263043;color:#f4f6fb;selection-background-color:#2c3a55;}
+QHeaderView::section {background:#1c2433;color:#a9b8ce;border:0;padding:6px;font-weight:600;}
+QTableCornerButton::section {background:#1c2433;border:0;} QListWidget::item:selected {background:#2c3a55;}
 '''
 
 ZOOM_ITEMS = ['100% — весь кадр', '115%', '130%', '150%', '175% — почти без полос']
@@ -99,6 +104,141 @@ class PreviewWorker(QObject):
             self.done.emit(out, note, r['id'])
         except Exception as e:
             self.failed.emit(str(e)[:300], r['id'])
+
+
+def _fmt_precise(t: float) -> str:
+    t = max(0.0, t); return f'{int(t // 60)}:{t % 60:04.1f}'
+
+
+def _parse_time(text: str) -> float | None:
+    text = text.strip().replace(',', '.')
+    try:
+        if ':' in text:
+            m, sec = text.rsplit(':', 1); return int(m) * 60 + float(sec)
+        return float(text)
+    except ValueError:
+        return None
+
+
+class CaptionEditor(QWidget):
+    """Edit the subtitles of one moment before montage: fix text, add missing lines, delete wrong ones.
+
+    Edits replace the transcript words inside the moment, so captions, hook search and pause cutting
+    all use the corrected text. Word timings inside a line are spread by word length.
+    """
+
+    def __init__(self, window):
+        super().__init__(); self.win = window; self.clip = None; self._filling = False; self._player = None
+        v = QVBoxLayout(self); v.setContentsMargins(0, 0, 0, 0)
+        hint = QLabel('Двойной щелчок по тексту — исправить. Время можно поправить в первых двух столбцах.')
+        hint.setObjectName('muted'); hint.setWordWrap(True); v.addWidget(hint)
+        self.table = QTableWidget(0, 3); self.table.setHorizontalHeaderLabels(['Начало', 'Конец', 'Текст'])
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.table.setColumnWidth(0, 80); self.table.setColumnWidth(1, 80)
+        self.table.verticalHeader().setVisible(False); self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection); self.table.setWordWrap(True)
+        self.table.itemChanged.connect(self._on_changed); self.table.currentCellChanged.connect(self._on_row)
+        v.addWidget(self.table, 1)
+        row = QHBoxLayout()
+        b = QPushButton('▶ Прослушать'); b.clicked.connect(self.listen); row.addWidget(b)
+        b = QPushButton('+ Строка здесь'); b.setToolTip('Добавить строку в момент, на котором стоит ползунок превью'); b.clicked.connect(self.add_row); row.addWidget(b)
+        b = QPushButton('Удалить строку'); b.clicked.connect(self.delete_row); row.addWidget(b)
+        row.addStretch(); v.addLayout(row)
+        self._apply_timer = QTimer(self); self._apply_timer.setSingleShot(True); self._apply_timer.timeout.connect(self.apply)
+
+    def set_clip(self, clip: dict | None):
+        self.clip = clip; self._filling = True
+        self.table.setRowCount(0)
+        if clip and self.win.analysis:
+            words = [w for w in self.win.analysis['words'] if w['end'] > clip['start'] and w['start'] < clip['end']]
+            for s in build_sentences(words, max_pause=0.6, max_words=12):
+                self._append(s['start'], s['end'], s['text'])
+        self._filling = False
+
+    def _append(self, a: float, b: float, text: str, at: int | None = None):
+        r = self.table.rowCount() if at is None else at
+        self.table.insertRow(r)
+        for col, val in enumerate((_fmt_precise(a), _fmt_precise(b), text)):
+            self.table.setItem(r, col, QTableWidgetItem(val))
+        return r
+
+    def rows(self) -> list[tuple[float, float, str]]:
+        out = []
+        for r in range(self.table.rowCount()):
+            a = _parse_time(self.table.item(r, 0).text()); b = _parse_time(self.table.item(r, 1).text())
+            text = ' '.join(self.table.item(r, 2).text().split())
+            if a is not None and b is not None and b > a and text: out.append((a, b, text))
+        return sorted(out)
+
+    def _on_changed(self, item):
+        if self._filling: return
+        if item.column() < 2 and _parse_time(item.text()) is None:
+            item.setBackground(Qt.darkRed)
+        else:
+            item.setBackground(Qt.transparent)
+        self._apply_timer.start(400)
+
+    def _on_row(self, row, *_):
+        if row < 0 or not self.clip or self._filling: return
+        a = _parse_time(self.table.item(row, 0).text()) if self.table.item(row, 0) else None
+        if a is not None:
+            self.win.select_preview.set_source(self.win.analysis['source'], self.clip['start'], self.clip['end'],
+                                               self.win.analysis['words'], at=min(self.clip['end'], a + 0.15))
+
+    def add_row(self):
+        if not self.clip: return
+        t = self.win.select_preview.current_time() if self.win.select_preview.source else self.clip['start']
+        pos = 0
+        while pos < self.table.rowCount() and (_parse_time(self.table.item(pos, 0).text()) or 0) <= t: pos += 1
+        self._filling = True; r = self._append(t, min(self.clip['end'], t + 2.0), 'новая фраза', at=pos); self._filling = False
+        self.table.setCurrentCell(r, 2); self.table.editItem(self.table.item(r, 2))
+        self._apply_timer.start(400)
+
+    def delete_row(self):
+        r = self.table.currentRow()
+        if r >= 0: self.table.removeRow(r); self._apply_timer.start(10)
+
+    def apply(self):
+        """Replace the transcript words inside this moment with the edited lines."""
+        if not self.clip or not self.win.analysis: return
+        new_words = []
+        for a, b, text in self.rows():
+            tokens = text.split(); total = sum(len(t) + 1 for t in tokens); cur = a
+            for tok in tokens:
+                d = (b - a) * (len(tok) + 1) / total
+                new_words.append({'start': round(cur, 3), 'end': round(cur + d * 0.92, 3), 'word': ' ' + tok}); cur += d
+        words = self.win.analysis['words']
+        keep = [w for w in words if w['end'] <= self.clip['start'] or w['start'] >= self.clip['end']]
+        words[:] = sorted(keep + new_words, key=lambda w: w['start'])   # in place: preview and montage share this list
+        self.clip['transcript'] = ' '.join(t for _, _, t in self.rows())
+        self.win.captions_edited = True
+        self.win.select_preview.request()
+
+    def listen(self):
+        r = self.table.currentRow()
+        if r < 0 or not self.win.analysis:
+            QMessageBox.information(self, 'Прослушать', 'Выберите строку в таблице.'); return
+        a = _parse_time(self.table.item(r, 0).text()); b = _parse_time(self.table.item(r, 1).text())
+        if a is None or b is None: return
+        src = self.win.analysis['source']
+        if self._player is not None:
+            try: self._player.kill()
+            except Exception: pass
+        ffplay = which('ffplay')
+        if ffplay:
+            import subprocess
+            self._player = subprocess.Popen([ffplay, '-nodisp', '-autoexit', '-loglevel', 'quiet', '-ss', f'{max(0.0, a - 0.2):.2f}',
+                                             '-t', f'{b - a + 0.5:.2f}', src], **NO_WINDOW)
+            return
+        try:
+            from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+            if not hasattr(self, '_qt_player'):
+                self._qt_player = QMediaPlayer(self); self._qt_out = QAudioOutput(self); self._qt_player.setAudioOutput(self._qt_out)
+                self._qt_stop = QTimer(self); self._qt_stop.setSingleShot(True); self._qt_stop.timeout.connect(self._qt_player.stop)
+            self._qt_player.setSource(QUrl.fromLocalFile(src)); self._qt_player.setPosition(int(max(0.0, a - 0.2) * 1000))
+            self._qt_player.play(); self._qt_stop.start(int((b - a + 0.5) * 1000))
+        except Exception:
+            QMessageBox.information(self, 'Прослушать', 'Не найден ffplay (входит в FFmpeg) — прослушивание недоступно.')
 
 
 class PreviewPane(QWidget):
@@ -362,7 +502,10 @@ class MainWindow(QMainWindow):
         pw = QWidget(); pv = QVBoxLayout(pw); pv.setContentsMargins(6, 0, 6, 0); pv.addWidget(self.select_preview)
         pw_area = self._scroll(pw); pw_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff); pw_area.setFixedWidth(290)
         rh.addWidget(pw_area)
-        self.cand_detail = QTextEdit(); self.cand_detail.setReadOnly(True); rh.addWidget(self.cand_detail, 1)
+        self.cand_detail = QTextEdit(); self.cand_detail.setReadOnly(True)
+        self.caption_editor = CaptionEditor(self)
+        self.detail_tabs = QTabWidget(); self.detail_tabs.addTab(self.cand_detail, 'Описание'); self.detail_tabs.addTab(self.caption_editor, 'Субтитры')
+        rh.addWidget(self.detail_tabs, 1)
         split.addWidget(right); split.setSizes([380, 700])
         lay.addWidget(split, 1)
         row = QHBoxLayout()
@@ -806,6 +949,7 @@ class MainWindow(QMainWindow):
         self.select_preview.set_source(self.analysis['source'], c['start'], c['end'], self.analysis['words'])
         self.cand_detail.setPlainText(f"Отрезок исходника: {_fmt(c['start'])}–{_fmt(c['end'])}\nОценка: {c.get('score', 0):.0f}/100\n"
                                       f"Почему: {c.get('reason') or '—'}\nХук: {c.get('hook') or '—'}\n\nТекст:\n{c.get('transcript', '')}")
+        self.caption_editor.set_clip(c)
 
     def _toggle_item(self, item):
         item.setCheckState(Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked)
@@ -819,10 +963,25 @@ class MainWindow(QMainWindow):
         chosen = [c for i, c in enumerate(self.analysis['clips']) if self.cand_list.item(i).checkState() == Qt.Checked]
         if not chosen:
             QMessageBox.information(self, 'Ничего не выбрано', 'Отметьте хотя бы один момент или нажмите «Пропустить это видео».'); return
+        self.caption_editor.apply() if self.caption_editor._apply_timer.isActive() else None
+        self._save_edited_captions()
         self._set_select_enabled(False); self.tabs.setCurrentIndex(0)
         self._start_render(sorted(chosen, key=lambda c: c.get('score', 0), reverse=True))
 
+    def _save_edited_captions(self):
+        """Keep subtitle edits in the transcript cache, so re-processing this video keeps them."""
+        if not getattr(self, 'captions_edited', False) or not self.analysis: return
+        cache = Path(self.analysis['out_dir']) / 'transcript_cache.json'
+        try:
+            data = json.loads(cache.read_text(encoding='utf-8')) if cache.exists() else {}
+            data['words'] = self.analysis['words']; data['edited'] = True
+            cache.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+        except Exception:
+            pass
+        self.captions_edited = False
+
     def skip_video(self):
+        self._save_edited_captions()
         self._set_select_enabled(False); self.cand_list.clear(); self.tabs.setCurrentIndex(0)
         self._next_video()
 
