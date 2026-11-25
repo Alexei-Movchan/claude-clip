@@ -933,16 +933,40 @@ def make_mapper(keep: list[tuple[float, float]]):
 
 
 def _crop_expression(keyframes: list[tuple[float, float]], crop_w: int, src_w: int) -> str:
-    max_x = max(0, src_w - crop_w)
-    pts = sorted((max(0.0, float(t)), max(0.0, min(float(x) - crop_w / 2, max_x))) for t, x in keyframes)
-    expr = f'{pts[-1][1]:.1f}'
-    for idx in range(len(pts) - 2, -1, -1):
-        t0, x0 = pts[idx]; t1, x1 = pts[idx + 1]
-        if t1 <= t0: continue
-        part = f'{x0:.1f}' if abs(x1 - x0) < 0.5 else f'({x0:.1f}+({x1 - x0:.1f})*(t-{t0:.3f})/{t1 - t0:.3f})'
-        expr = rf'if(lt(t\,{t1:.3f})\,{part}\,{expr})'
-    return expr
+    """Piecewise-linear x(t) as an FFmpeg expression.
 
+    Built as a balanced tree of if()s: FFmpeg refuses expressions nested deeper than ~100 levels,
+    and a long clip has hundreds of keyframes, so a plain if-chain broke the render.
+    """
+    max_x = max(0, src_w - crop_w)
+    raw = sorted((max(0.0, float(t)), max(0.0, min(float(x) - crop_w / 2, max_x))) for t, x in keyframes)
+    pts: list[tuple[float, float]] = []
+    for t, x in raw:
+        if pts and t - pts[-1][0] < 0.001:
+            pts[-1] = (pts[-1][0], x)
+        else:
+            pts.append((t, x))
+    # pieces[i] is active from bounds[i-1] up to bounds[i]; the last piece holds the final value.
+    pieces: list[str] = []
+    bounds: list[float] = []
+    for (t0, x0), (t1, x1) in zip(pts, pts[1:]):
+        part = f'{x0:.1f}' if abs(x1 - x0) < 0.5 else f'({x0:.1f}+({x1 - x0:.1f})*(t-{t0:.3f})/{t1 - t0:.3f})'
+        if pieces and part == pieces[-1] and '(' not in part:
+            bounds[-1] = t1                      # same constant continues: merge
+            continue
+        pieces.append(part); bounds.append(t1)
+    last = f'{pts[-1][1]:.1f}'
+    if pieces and pieces[-1] == last:
+        bounds.pop()
+    else:
+        pieces.append(last)
+
+    def tree(lo: int, hi: int) -> str:
+        if lo == hi:
+            return pieces[lo]
+        mid = (lo + hi) // 2
+        return rf'if(lt(t\,{bounds[mid]:.3f})\,{tree(lo, mid)}\,{tree(mid + 1, hi)})'
+    return tree(0, len(pieces) - 1)
 
 # --------------------------------------------------------------------------- encoder (GPU NVENC with CPU fallback)
 
@@ -994,15 +1018,48 @@ def run_progress(cmd: list[str], duration: float, callback: Callable[[float], No
     callback(1.0)
 
 
+_FF_VER: list[tuple[int, int]] = []
+
+
+def _ffmpeg_version() -> tuple[int, int]:
+    if not _FF_VER:
+        ver = (0, 0)
+        try:
+            out = subprocess.run([ffmpeg_path(), '-version'], capture_output=True, text=True, timeout=20, **NO_WINDOW).stdout
+            m = re.search(r'version\s+n?(\d+)\.(\d+)', out)
+            if m: ver = (int(m.group(1)), int(m.group(2)))
+        except Exception:
+            pass
+        _FF_VER.append(ver)
+    return _FF_VER[0]
+
+
+def _graph_via_file(cmd: list[str], tmpdir: str) -> list[str]:
+    """Long filter graphs go through a file: Windows limits a command line to ~32 000 characters."""
+    if '-filter_complex' not in cmd: return cmd
+    i = cmd.index('-filter_complex')
+    graph = cmd[i + 1]
+    if len(graph) < 6000: return cmd
+    path = os.path.join(tmpdir, 'graph.txt')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(graph)
+    major, minor = _ffmpeg_version()
+    # FFmpeg 7.1+ reads any option from a file with the '-/' prefix; older builds have -filter_complex_script.
+    opt = ['-/filter_complex', path] if (major, minor) >= (7, 1) else ['-filter_complex_script', path]
+    return cmd[:i] + opt + cmd[i + 2:]
+
+
 def _encode(head: list[str], tail: list[str], quality: int, duration: float = 0.0,
             progress: Callable[[float], None] | None = None) -> None:
     args, gpu = _vcodec(quality)
-    try:
-        run_progress(head + args + tail, duration, progress)
-    except RuntimeError:
-        if not gpu: raise
-        _ENC['nvenc'] = False  # driver/VRAM problem: finish the job on the CPU
-        run_progress(head + _vcodec(quality)[0] + tail, duration, progress)
+    with tempfile.TemporaryDirectory(prefix='cloudy_graph_') as td:
+        head = _graph_via_file(head, td)
+        try:
+            run_progress(head + args + tail, duration, progress)
+        except RuntimeError:
+            if not gpu: raise
+            _ENC['nvenc'] = False  # driver/VRAM problem: finish the job on the CPU
+            run_progress(head + _vcodec(quality)[0] + tail, duration, progress)
 
 
 # --------------------------------------------------------------------------- emphasis & hook
