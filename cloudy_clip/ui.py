@@ -443,6 +443,8 @@ class MainWindow(QMainWindow):
         self._loading = True
         self.load_settings()
         self._loading = False
+        self._res_thumbs: dict[str, QPixmap] = {}
+        self._load_session()
         self._wire_autosave()
         self.tray = QSystemTrayIcon(self.windowIcon(), self) if QSystemTrayIcon.isSystemTrayAvailable() else None
         self._t_start = None; self._eta = -1.0; self._eta_at = 0.0
@@ -612,7 +614,7 @@ class MainWindow(QMainWindow):
         self.cand_list.setMovement(QListWidget.Static); self.cand_list.setIconSize(QSize(150, 266)); self.cand_list.setGridSize(QSize(176, 350))
         self.cand_list.setWordWrap(True); self.cand_list.setSpacing(6); self.cand_list.setUniformItemSizes(True)
         self.cand_list.currentRowChanged.connect(self.show_candidate); self.cand_list.itemDoubleClicked.connect(self._toggle_item)
-        self.cand_list.itemChanged.connect(lambda *_: self._update_pick_count())
+        self.cand_list.itemChanged.connect(lambda *_: (self._update_pick_count(), self._save_session_later()))
         self.cand_list.setMinimumWidth(190); split.addWidget(self.cand_list)
         right = QFrame(); right.setObjectName('card'); rh = QHBoxLayout(right); rh.setContentsMargins(14, 14, 14, 14); rh.setSpacing(12)
         self.select_preview = PreviewPane(self, speaker_option=True, hint='Выберите момент слева')
@@ -638,6 +640,8 @@ class MainWindow(QMainWindow):
         t = QLabel('Результаты'); t.setObjectName('h1'); texts.addWidget(t)
         self.results_title = QLabel('Готовые ролики появятся здесь.'); self.results_title.setObjectName('muted'); texts.addWidget(self.results_title)
         head.addLayout(texts, 1)
+        b = QPushButton('Очистить список'); b.setObjectName('ghost'); b.setToolTip('Убирает ролики из списка. Сами файлы остаются в папке.')
+        b.clicked.connect(self.clear_results); head.addWidget(b, 0, Qt.AlignBottom)
         b = QPushButton('Открыть папку'); b.setObjectName('ghost'); b.clicked.connect(self.open_folder); head.addWidget(b, 0, Qt.AlignBottom)
         lay.addLayout(head)
         split = QSplitter(Qt.Horizontal); split.setHandleWidth(10)
@@ -977,15 +981,23 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, 'Проверка файлов', str(e)); return
         if bad:
             QMessageBox.critical(self, 'Слишком короткие видео', 'Эти видео короче 90 секунд:\n' + '\n'.join(bad)); return
+        self._render_only = False
+        self._begin_run(list(self.sources))
+        self._next_video()
+
+    def _running(self) -> bool:
+        btn = getattr(self, 'cancel_btn', None)
+        return bool(btn and btn.isEnabled())
+
+    def _begin_run(self, queue: list[str]):
         self.save_settings()
         self.run_settings = self.collect_settings()
-        self.queue = list(self.sources); self.total_videos = len(self.queue); self._cancelled = False
-        self.results = []; self.list.clear(); self.tabs.set_badge(3, ''); self.results_title.setText('Готовые ролики появятся здесь.')
+        self.queue = queue; self.total_videos = max(1, len(queue)); self._cancelled = False
+        self.run_results: list[dict] = []
         self.stepper.set_step(0)
         self.start_btn.setEnabled(False); self.cancel_btn.setEnabled(True)
         self._t_start = time.monotonic(); self._eta = -1.0
         _keep_awake(True)
-        self._next_video()
 
     def _run(self, worker, on_finished, on_failed):
         # Keep Python references to threads/workers until they finish (GC would delete them mid-run).
@@ -1015,6 +1027,7 @@ class MainWindow(QMainWindow):
         if self._cancelled: self._finish_all(); return
         if self.run_settings.get('manual_pick', True):
             self._fill_candidates(payload)
+            self._save_session()
             self.tabs.setCurrentIndex(2); self._eta = -1.0
             self.status.setText('Отметьте моменты и нажмите «Смонтировать выбранные».')
             self._notify('Моменты найдены', f"{Path(payload['source']).name}: выберите, что монтировать.")
@@ -1023,25 +1036,55 @@ class MainWindow(QMainWindow):
 
     def _start_render(self, clips: list[dict]):
         if not clips: self._next_video(); return
+        clips = sorted(clips, key=lambda c: float(c['start']))  # Clip_01, Clip_02… follow the episode in order
         p = self.analysis
         self._run(RenderWorker(p['source'], self.banner, p['out_dir'], self.run_settings, clips, p['words'], p.get('scenes')),
                   self.on_rendered, self.on_failed)
 
     def on_rendered(self, results: list, msg: str):
-        start = len(self.results)
-        self.results.extend(results)
+        self.run_results.extend(results)
+        fresh = {r['file'] for r in results}
+        self.results = [r for r in self.results if r['file'] not in fresh] + list(results)
+        for r in results: self._res_thumbs.pop(r['file'], None)
+        self._refresh_results(select=results[0]['file'] if results else None)
+        self._save_session()
+        self._next_video()
+
+    @staticmethod
+    def _result_key(r: dict):
+        # Grouped by source video, then in story order inside it.
+        return (str(Path(r['file']).parent).lower(), float(r.get('start', 0)), r['file'])
+
+    def _refresh_results(self, select: str | None = None):
+        current = self._selected()
+        keep = select or (current['file'] if current else None)
+        self.results.sort(key=self._result_key)
+        self.list.blockSignals(True); self.list.clear()
         jobs = []
-        for n, r in enumerate(results, start):
+        for r in self.results:
             title = r.get('title') or Path(r['file']).stem
-            item = QListWidgetItem(f"{title}\n{Path(r['file']).parent.name}")
-            item.setIcon(QIcon(rounded(placeholder_thumb(), badge=_fmt(r['banner']['duration']))))
+            item = QListWidgetItem(f"{title}\n{Path(r['file']).parent.name} · {_fmt(r['start'])}–{_fmt(r['end'])}")
+            pm = self._res_thumbs.get(r['file'])
+            item.setIcon(QIcon(rounded(pm if pm is not None else placeholder_thumb(), badge=_fmt(r['banner']['duration']))))
             item.setToolTip(Path(r['file']).name)
             self.list.addItem(item)
-            jobs.append({'key': f'res:{n}', 'kind': 'frame', 'source': r['file'], 't': min(4.0, r['banner']['duration'] / 3)})
+            if pm is None:
+                jobs.append({'key': 'res:' + r['file'], 'kind': 'frame', 'source': r['file'], 't': min(4.0, r['banner']['duration'] / 3)})
+        self.list.blockSignals(False)
         self._start_thumbs(jobs)
-        self.tabs.set_badge(3, str(len(self.results)))
-        self.results_title.setText(f'Готово роликов: {len(self.results)} · двойной щелчок — открыть')
-        self._next_video()
+        n = len(self.results)
+        self.tabs.set_badge(3, str(n) if n else '')
+        self.results_title.setText(f'Готово роликов: {n} · по порядку в серии · двойной щелчок — открыть' if n
+                                   else 'Готовые ролики появятся здесь.')
+        row = next((i for i, r in enumerate(self.results) if r['file'] == keep), 0 if n else -1)
+        if row >= 0: self.list.setCurrentRow(row)
+        else: self.preview_title.setText('Выберите ролик'); self.detail.clear()
+
+    def clear_results(self):
+        if not self.results: return
+        if QMessageBox.question(self, 'Очистить список', 'Убрать все ролики из списка?\nСами файлы останутся в папке.') != QMessageBox.Yes:
+            return
+        self.results = []; self._res_thumbs.clear(); self._refresh_results(); self._save_session()
 
     def on_failed(self, error: str):
         name = Path(self.current_source).name if self.current_source else ''
@@ -1050,24 +1093,29 @@ class MainWindow(QMainWindow):
         self._next_video()
 
     def _finish_all(self):
-        self.start_btn.setEnabled(True); self.cancel_btn.setEnabled(False); self._set_select_enabled(False)
-        self.queue_label.setText(''); self.stepper.set_step(3 if not self._cancelled and self.results else -1)
+        self.start_btn.setEnabled(True); self.cancel_btn.setEnabled(False)
+        self._set_select_enabled(self.cand_list.count() > 0)  # saved moments can be montaged again later
+        made = getattr(self, 'run_results', [])
+        self.queue_label.setText(''); self.stepper.set_step(3 if not self._cancelled and made else -1)
         msg = 'Обработка остановлена' if self._cancelled else 'Обработка завершена'
         took = f' за {_human(time.monotonic() - self._t_start)}' if self._t_start else ''
-        self.status.setText(f'{msg}{took}. Создано роликов: {len(self.results)}')
+        self.status.setText(f'{msg}{took}. Создано роликов: {len(made)}')
         self._t_start = None; self._eta = -1.0; self.eta_label.setText(''); self.setWindowTitle('Cloudy Clip Studio')
         _keep_awake(False)
         if not self._cancelled:
-            self._notify('Готово', f'Создано роликов: {len(self.results)}{took}')
-        if self.results:
-            self.tabs.setCurrentIndex(3); self.list.setCurrentRow(0)
-        elif not self._cancelled:
+            self._notify('Готово', f'Создано роликов: {len(made)}{took}')
+        self._save_session()
+        if made:
+            self.tabs.setCurrentIndex(3)
+            row = next((i for i, r in enumerate(self.results) if r['file'] == made[0]['file']), 0)
+            self.list.setCurrentRow(row)
+        elif not self._cancelled and not getattr(self, '_render_only', False):
             QMessageBox.warning(self, 'Нет результатов', 'Не удалось создать нарезки. Проверьте длину видео и звук.')
 
     def cancel_processing(self):
         self._cancelled = True; self.queue.clear()
         if self.worker: self.worker.cancel()
-        if self.render_btn.isEnabled():  # waiting on the selection screen
+        if self.render_btn.isEnabled() and not isinstance(self.worker, RenderWorker):  # waiting on the selection screen
             self._finish_all()
         self.status.setText('Запрошена остановка. Текущий ролик будет завершён.')
 
@@ -1102,8 +1150,10 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ selection screen
     def _set_select_enabled(self, on: bool):
         self.render_btn.setEnabled(on); self.skip_btn.setEnabled(on)
+        self.skip_btn.setText('Пропустить видео' if self._running() else 'Убрать моменты')
 
-    def _fill_candidates(self, payload: dict):
+    def _fill_candidates(self, payload: dict, checked: list[bool] | None = None):
+        self.cand_list.blockSignals(True)
         self.cand_list.clear()
         clips = sorted(payload['clips'], key=lambda c: c['start'])
         payload['clips'] = clips
@@ -1116,11 +1166,13 @@ class MainWindow(QMainWindow):
             score = 'добор' if str(c.get('reason', '')).startswith('Добор') else f"{c.get('score', 0):.0f}/100"
             item = QListWidgetItem(f"{title}\n{_fmt(c['start'])} · {score}")
             item.setIcon(QIcon(rounded(placeholder_thumb(), badge=_fmt(dur))))
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable); item.setCheckState(Qt.Checked)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if checked is None or n >= len(checked) or checked[n] else Qt.Unchecked)
             item.setToolTip(c.get('reason') or '')
             self.cand_list.addItem(item)
             jobs.append({'key': f'cand:{n}', 'kind': 'clip', 'source': payload['source'], 't': c['start'] + min(8.0, dur / 3),
                          'words': payload['words'], 'zoom': st['zoom'], 'background': st['background'], 'style': st['style']})
+        self.cand_list.blockSignals(False)
         self._start_thumbs(jobs)
         self.tabs.set_badge(2, str(len(clips)))
         self._set_select_enabled(True); self._update_pick_count()
@@ -1141,19 +1193,19 @@ class MainWindow(QMainWindow):
         self._thumb_threads.append((thread, worker)); thread.start()
 
     def _on_thumb(self, key: str, path: str):
-        kind, _, idx = key.partition(':')
-        lst = self.cand_list if kind == 'cand' else self.list
-        i = int(idx)
-        if i >= lst.count(): return
-        item = lst.item(i); pm = QPixmap(path)
+        kind, _, ref = key.partition(':')
+        pm = QPixmap(path)
         if pm.isNull(): return
         if kind == 'cand':
+            i = int(ref)
+            if i >= self.cand_list.count(): return
             c = self.analysis['clips'][i] if self.analysis and i < len(self.analysis['clips']) else None
-            badge = _fmt(c['end'] - c['start']) if c else ''
+            self.cand_list.item(i).setIcon(QIcon(rounded(pm, badge=_fmt(c['end'] - c['start']) if c else '')))
         else:
-            r = self.results[i] if i < len(self.results) else None
-            badge = _fmt(r['banner']['duration']) if r else ''
-        item.setIcon(QIcon(rounded(pm, badge=badge)))
+            self._res_thumbs[ref] = pm
+            i = next((n for n, r in enumerate(self.results) if r['file'] == ref), -1)
+            if 0 <= i < self.list.count():
+                self.list.item(i).setIcon(QIcon(rounded(pm, badge=_fmt(self.results[i]['banner']['duration']))))
 
     def show_candidate(self, row: int):
         if not self.analysis or row < 0 or row >= len(self.analysis['clips']): return
@@ -1177,8 +1229,13 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, 'Ничего не выбрано', 'Отметьте хотя бы один момент или нажмите «Пропустить это видео».'); return
         self.caption_editor.apply() if self.caption_editor._apply_timer.isActive() else None
         self._save_edited_captions()
+        self._render_only = not self._running()
+        if self._render_only:  # moments restored after a restart: start a run just for them
+            self._begin_run([])
+            self.current_source = self.analysis['source']
+            self.queue_label.setText(Path(self.current_source).name)
         self._set_select_enabled(False); self.tabs.setCurrentIndex(0)
-        self._start_render(sorted(chosen, key=lambda c: c.get('score', 0), reverse=True))
+        self._start_render(chosen)
 
     def _save_edited_captions(self):
         """Keep subtitle edits in the transcript cache, so re-processing this video keeps them."""
@@ -1194,8 +1251,60 @@ class MainWindow(QMainWindow):
 
     def skip_video(self):
         self._save_edited_captions()
-        self._set_select_enabled(False); self.cand_list.clear(); self.tabs.set_badge(2, ''); self.tabs.setCurrentIndex(0)
+        idle = not self._running()
+        self._set_select_enabled(False); self.cand_list.clear(); self.tabs.set_badge(2, '')
+        self.analysis = None; self.select_title.setText('Здесь появятся найденные моменты, если включён ручной выбор.')
+        self.cand_detail.clear(); self.caption_editor.set_clip(None)
+        self._save_session()
+        if idle: return
+        self.tabs.setCurrentIndex(0)
         self._next_video()
+
+    # ------------------------------------------------------------------ session (moments + results survive a restart)
+    SESSION = Path.home() / '.cloudy_clip_session.json'
+
+    def _save_session_later(self):
+        if not hasattr(self, '_session_timer'):
+            self._session_timer = QTimer(self); self._session_timer.setSingleShot(True); self._session_timer.timeout.connect(self._save_session)
+        self._session_timer.start(800)
+
+    def _save_session(self):
+        try:
+            results = []
+            for r in self.results:
+                r = dict(r); sp = r.get('speaker_tracking') or {}
+                r['speaker_tracking'] = {k: v for k, v in sp.items() if k != 'keyframes'}  # big and not needed later
+                results.append(r)
+            moments = None
+            if self.analysis and self.cand_list.count():
+                moments = {'source': self.analysis['source'], 'out_dir': self.analysis['out_dir'], 'clips': self.analysis['clips'],
+                           'checked': [self.cand_list.item(i).checkState() == Qt.Checked for i in range(self.cand_list.count())]}
+            tmp = self.SESSION.with_suffix('.json.tmp')
+            tmp.write_text(json.dumps({'results': results, 'moments': moments}, ensure_ascii=False), encoding='utf-8')
+            os.replace(tmp, self.SESSION)
+        except Exception:
+            pass
+
+    def _load_session(self):
+        try:
+            data = json.loads(self.SESSION.read_text(encoding='utf-8')) if self.SESSION.exists() else {}
+        except Exception:
+            data = {}
+        self.results = [r for r in data.get('results') or [] if r.get('file') and Path(r['file']).exists()]
+        self._refresh_results()
+        m = data.get('moments')
+        if not m or not Path(m.get('source', '')).exists(): return
+        try:
+            cache = Path(m['out_dir']) / '.cloudy' / 'transcript_cache.json'
+            words = json.loads(cache.read_text(encoding='utf-8')).get('words') or []
+            scenes_file = Path(m['out_dir']) / '.cloudy' / 'scenes.json'
+            scenes = json.loads(scenes_file.read_text(encoding='utf-8')) if scenes_file.exists() else None
+        except Exception:
+            return
+        if not words: return
+        self.analysis = {'source': m['source'], 'out_dir': m['out_dir'], 'words': words, 'transcript': '',
+                         'clips': m['clips'], 'scenes': scenes}
+        self._fill_candidates(self.analysis, m.get('checked'))
 
     # ------------------------------------------------------------------ results
     def show_result(self, row):
