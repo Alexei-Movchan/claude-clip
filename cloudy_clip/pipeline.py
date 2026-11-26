@@ -184,7 +184,8 @@ class RenderWorker(QObject):
             url = self.settings.get('ollama_url', 'http://127.0.0.1:11434'); model = self.settings.get('local_model', 'qwen3:4b')
             options = {'background': self.settings.get('background', 'blur'), 'hook': self.settings.get('hook', True),
                        'punch_ins': self.settings.get('punch_ins', True), 'srt': self.settings.get('srt', True),
-                       'subtitle_style': self.settings.get('subtitle_style'), 'scenes': self.scenes}
+                       'subtitle_style': self.settings.get('subtitle_style'), 'scenes': self.scenes,
+                       'speaker_frame': self.settings.get('speaker_frame', 'full')}
             results = []
             n = len(clips)
             first_no = next_clip_number(self.out_dir)

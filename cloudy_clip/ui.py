@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
     QScrollArea, QFrame, QSystemTrayIcon, QStyle, QProgressDialog, QSlider, QTableWidget, QTableWidgetItem,
     QHeaderView, QAbstractItemView, QSizePolicy)
 from .pipeline import AnalyzeWorker, RenderWorker, output_dir_for, data_dir_for
-from .media import (ffmpeg_available, probe, render_preview_frame, build_sentences, which, NO_WINDOW,
+from .media import (SPEAKER_ASPECTS, ffmpeg_available, probe, render_preview_frame, build_sentences, which, NO_WINDOW,
                     SUB_PRESETS, SUB_POSITIONS, ACTIVE_COLORS)
 from .widgets import (Switch, NavStack, DropZone, SourceCard, Stepper, Segmented, ThumbWorker, svg_icon,
                       placeholder_thumb, rounded)
@@ -134,7 +134,8 @@ class PreviewWorker(QObject):
                 if r.get('crop_on', True):
                     kf = analyze_active_speaker(r['source'], a, b, r.get('words') or []).get('keyframes') or []
                     if kf:
-                        cx = min(kf, key=lambda k: abs(k[0] - rel))[1]; note = 'кадр по говорящему (на весь экран)'
+                        cx = min(kf, key=lambda k: abs(k[0] - rel))[1]
+                        note = 'кадр по говорящему' + (' (на весь экран)' if r.get('speaker_frame', 'full') == 'full' else '')
                 if cx is None and r.get('follow_on', True):
                     kf = soft_follow_keyframes(r['source'], a, b, sample_fps=3).get('keyframes') or []
                     if kf:
@@ -143,7 +144,8 @@ class PreviewWorker(QObject):
                     note = 'лицо не найдено — кадр по центру'
             out = os.path.join(r['dir'], f"preview_{r['id']}.png")
             render_preview_frame(r['source'], r['t'], out, words=r.get('words'), zoom=r['zoom'], background=r['background'],
-                                 subtitle_style=r['style'], crop_center_x=cx, info=r.get('info'), follow_center_x=fx)
+                                 subtitle_style=r['style'], crop_center_x=cx, info=r.get('info'), follow_center_x=fx,
+                                 crop_aspect=SPEAKER_ASPECTS.get(r.get('speaker_frame', 'full'), 9 / 16))
             self.done.emit(out, note, r['id'])
         except Exception as e:
             self.failed.emit(str(e)[:300], r['id'])
@@ -564,11 +566,16 @@ class MainWindow(QMainWindow):
         self.background = QComboBox(); self.background.addItems(['Размытое видео', 'Чёрные полосы']); ff.addRow('Фон вместо полос', self.background)
         self.zoom = QComboBox(); self.zoom.addItems(ZOOM_ITEMS); self.zoom.setCurrentText('130%'); ff.addRow('Размер видео', self.zoom)
         n = QLabel('Для горизонтального видео: чем крупнее, тем меньше фон, но сильнее обрезаются края. '
-                   'Если программа уверенно нашла говорящего, кадр заполняет весь экран.'); n.setWordWrap(True); n.setObjectName('muted'); ff.addRow(n)
+                   'Если программа уверенно нашла говорящего, кадр строится вокруг него (форма — ниже).'); n.setWordWrap(True); n.setObjectName('muted'); ff.addRow(n)
         self.hook = Switch('Хук: самая цепляющая фраза ролика в первые секунды'); self.hook.setChecked(True); ff.addRow(self.hook)
         self.punch = Switch('Приближения на громких и эмоциональных моментах'); self.punch.setChecked(True); ff.addRow(self.punch)
-        self.speaker_crop = Switch('Кадрирование по говорящему: если найдено лицо, кадр заполняет весь экран и следует за ним')
+        self.speaker_crop = Switch('Кадрирование по говорящему: если найдено лицо, кадр обрезается вокруг него и следует за ним')
         self.speaker_crop.setChecked(True); ff.addRow(self.speaker_crop)
+        self.speaker_frame = QComboBox(frame); self.speaker_frame.addItems(['На весь экран', '4:5', 'Квадрат'])
+        self.speaker_frame.setCurrentIndex(2); self.speaker_frame.hide()  # square with background above and below, as in TikTok edits
+        self.speaker_frame_seg = Segmented(self.speaker_frame, ['На весь экран', '4:5 · небольшие отступы', 'Квадрат'])
+        ff.addRow('Кадр по говорящему', self.speaker_frame_seg)
+        self.speaker_crop.toggled.connect(self.speaker_frame_seg.setEnabled)
         self.soft_follow = Switch('Мягкое слежение за лицом: увеличенное видео плавно сдвигается за лицом, чтобы его не обрезало')
         self.soft_follow.setChecked(True); ff.addRow(self.soft_follow)
         self.scene_analysis = Switch('Анализ сцен: ролики заканчиваются на смене сцены или конце разговора, паузы с действием остаются, заставки вырезаются')
@@ -614,7 +621,7 @@ class MainWindow(QMainWindow):
         for sig in (self.background.currentIndexChanged, self.zoom.currentIndexChanged, self.sub_preset.currentIndexChanged,
                     self.sub_font.currentFontChanged, self.sub_size.valueChanged, self.sub_pos.currentIndexChanged,
                     self.sub_color.currentIndexChanged, self.sub_upper.toggled, self.sub_nopunct.toggled, self.speaker_crop.toggled,
-                    self.soft_follow.toggled):
+                    self.soft_follow.toggled, self.speaker_frame.currentIndexChanged):
             sig.connect(lambda *_: self.design_preview.request())
         self.tabs.addTab(page, 'Оформление')
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -726,7 +733,10 @@ class MainWindow(QMainWindow):
     def preview_settings(self) -> dict:
         return {'zoom': int(self.zoom.currentText().split('%')[0]) / 100,
                 'background': 'black' if self.background.currentIndex() == 1 else 'blur',
-                'style': self.subtitle_style()}
+                'style': self.subtitle_style(), 'speaker_frame': self.speaker_frame_key()}
+
+    def speaker_frame_key(self) -> str:
+        return ('full', '4:5', '1:1')[max(0, self.speaker_frame.currentIndex())]
 
     def _on_tab_changed(self, index: int):
         if index == 1: self._sync_design_preview()
@@ -754,7 +764,7 @@ class MainWindow(QMainWindow):
                 'background': 'black' if self.background.currentIndex() == 1 else 'blur',
                 'hook': self.hook.isChecked(), 'punch_ins': self.punch.isChecked(), 'srt': self.srt.isChecked(),
                 'speaker_crop': self.speaker_crop.isChecked(), 'soft_follow': self.soft_follow.isChecked(),
-                'scene_analysis': self.scene_analysis.isChecked(),
+                'scene_analysis': self.scene_analysis.isChecked(), 'speaker_frame': self.speaker_frame_key(),
                 'fill_clips': self.fill_clips.currentIndex() == 0, 'save_txt': self.save_txt.isChecked(),
                 'ai_descriptions': self.ai_desc.isChecked(), 'manual_pick': self.manual_pick.isChecked(),
                 'subtitle_style': self.subtitle_style(),
@@ -776,7 +786,8 @@ class MainWindow(QMainWindow):
         ui = d.get('ui', {})
         for key, widget in (('whisper', self.whisper), ('device', self.device), ('zoom', self.zoom)):
             if ui.get(key): widget.setCurrentText(ui[key])
-        for key, widget in (('encoder', self.encoder), ('background', self.background), ('fill_clips', self.fill_clips)):
+        for key, widget in (('encoder', self.encoder), ('background', self.background), ('fill_clips', self.fill_clips),
+                            ('speaker_frame', self.speaker_frame)):
             if isinstance(ui.get(key), int): widget.setCurrentIndex(ui[key])
         for key, widget in (('manual_pick', self.manual_pick), ('ai_desc', self.ai_desc), ('hook', self.hook),
                             ('punch', self.punch), ('srt', self.srt), ('speaker_crop', self.speaker_crop),
@@ -831,6 +842,7 @@ class MainWindow(QMainWindow):
              'shortcut_offered': self.shortcut_offered,
              'ui': {'whisper': self.whisper.currentText(), 'device': self.device.currentText(), 'zoom': self.zoom.currentText(),
                     'encoder': self.encoder.currentIndex(), 'background': self.background.currentIndex(),
+                    'speaker_frame': self.speaker_frame.currentIndex(),
                     'fill_clips': self.fill_clips.currentIndex(), 'save_txt': self.save_txt.isChecked(),
                     'manual_pick': self.manual_pick.isChecked(), 'ai_desc': self.ai_desc.isChecked(), 'hook': self.hook.isChecked(),
                     'punch': self.punch.isChecked(), 'srt': self.srt.isChecked(), 'subtitles': self.subtitle_style(),

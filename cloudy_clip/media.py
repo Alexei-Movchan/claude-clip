@@ -1142,21 +1142,34 @@ def follow_expression(keyframes: list[tuple[float, float]], info: dict, zoom: fl
     return _crop_expression([(t, x * k) for t, x in keyframes], OUT_W, sw)
 
 
+SPEAKER_ASPECTS = {'full': 9 / 16, '4:5': 4 / 5, '1:1': 1.0}
+
+
+def speaker_crop_width(info: dict, aspect: float = 9 / 16) -> int:
+    """Width of the speaker window in source pixels (full source height, given width:height)."""
+    return max(2, min(int(info['width']) // 2 * 2, int(info['height'] * aspect) // 2 * 2))
+
+
 def _framing(head: str, info: dict, crop_x_expr: str | None, zoom: float, background: str,
-             follow_x_expr: str | None = None) -> str:
+             follow_x_expr: str | None = None, crop_aspect: float = 9 / 16) -> str:
     """Filter chain that turns the source picture into a 1080x1920 frame, ending in label [fr].
 
-    crop_x_expr: speaker-tracking crop (x of the 9:16 window, may depend on t); None = fit with zoom.
+    crop_x_expr: speaker-tracking crop (x of the window, may depend on t); None = fit with zoom.
+    crop_aspect: 9/16 fills the whole screen; 4/5 or 1 keep a strip of background above and below.
     Shared by the real render and by the preview, so the preview shows exactly what you get.
     """
     if crop_x_expr is not None:
-        crop_w = max(2, int(info['height'] * 9 / 16) // 2 * 2)
-        return f"{head},crop={crop_w}:{info['height'] // 2 * 2}:'{crop_x_expr}':0,scale={OUT_W}:{OUT_H},setsar=1[fr]"
-    # zoom > 1 enlarges a landscape picture: sides are cropped a little, the bars shrink.
-    z = max(1.0, min(3.0, float(zoom)))
-    x_part = f":'{follow_x_expr}':'(ih-oh)/2'" if follow_x_expr else ''
-    fg = (f"scale=w='trunc(min({OUT_W * z:.1f}/iw\\,{OUT_H}/ih)*iw/2)*2':h=-2,"
-          f"crop='min(iw\\,{OUT_W})':'min(ih\\,{OUT_H})'{x_part}")
+        crop_w = speaker_crop_width(info, crop_aspect)
+        crop = f"crop={crop_w}:{info['height'] // 2 * 2}:'{crop_x_expr}':0"
+        if crop_aspect <= 9 / 16 + 1e-6:
+            return f"{head},{crop},scale={OUT_W}:{OUT_H},setsar=1[fr]"
+        fg = f"{crop},scale={OUT_W}:-2"
+    else:
+        # zoom > 1 enlarges a landscape picture: sides are cropped a little, the bars shrink.
+        z = max(1.0, min(3.0, float(zoom)))
+        x_part = f":'{follow_x_expr}':'(ih-oh)/2'" if follow_x_expr else ''
+        fg = (f"scale=w='trunc(min({OUT_W * z:.1f}/iw\\,{OUT_H}/ih)*iw/2)*2':h=-2,"
+              f"crop='min(iw\\,{OUT_W})':'min(ih\\,{OUT_H})'{x_part}")
     if background == 'blur':
         # Blurred, darkened copy of the same picture fills the bars (cheap: blurred at 1/4 size).
         return (f"{head},split=2[fgsrc][bgsrc];"
@@ -1172,7 +1185,7 @@ SAMPLE_CAPTION = ['Так', 'будут', 'выглядеть', 'субтитр�
 def render_preview_frame(source: str, t: float, out_png: str, words: list[dict] | None = None,
                          zoom: float = 1.3, background: str = 'blur', subtitle_style: dict | None = None,
                          crop_center_x: float | None = None, info: dict | None = None,
-                         follow_center_x: float | None = None) -> str:
+                         follow_center_x: float | None = None, crop_aspect: float = 9 / 16) -> str:
     """One finished-looking 1080x1920 frame at source time t (framing + background + captions).
 
     words: real transcript words (captions of that moment are shown, current word highlighted);
@@ -1197,10 +1210,10 @@ def render_preview_frame(source: str, t: float, out_png: str, words: list[dict] 
         write_ass(ass, shifted, 10.0, subtitle_style)
         expr = None
         if crop_center_x is not None and info['width'] / max(1, info['height']) > 9 / 16:
-            crop_w = max(2, int(info['height'] * 9 / 16) // 2 * 2)
+            crop_w = speaker_crop_width(info, crop_aspect)
             expr = f'{max(0.0, min(float(crop_center_x) - crop_w / 2, info["width"] - crop_w)):.1f}'
         fexpr = follow_expression([(0.0, follow_center_x)], info, zoom) if follow_center_x is not None and expr is None else None
-        graph = _framing('[0:v]setpts=PTS-STARTPTS', info, expr, zoom, background, fexpr)
+        graph = _framing('[0:v]setpts=PTS-STARTPTS', info, expr, zoom, background, fexpr, crop_aspect)
         graph += f";[fr]ass='{_ffmpeg_filter_path(ass)}'[v]"
         run([ffmpeg_path(), '-y', '-ss', f'{t:.3f}', '-i', source, '-filter_complex', graph, '-map', '[v]',
              '-frames:v', '1', out_png])
@@ -1211,7 +1224,7 @@ def _render_base(source: str, out: str, clip_start: float, clip_dur: float, keep
                  crop_keyframes: list[tuple[float, float]] | None, info: dict, zoom: float = 1.0,
                  background: str = 'blur', punches: list[float] | None = None,
                  progress: Callable[[float], None] | None = None,
-                 follow_keyframes: list[tuple[float, float]] | None = None) -> None:
+                 follow_keyframes: list[tuple[float, float]] | None = None, crop_aspect: float = 9 / 16) -> None:
     """One encode: cut the clip, drop long pauses, frame it as 9:16, normalise A/V format.
 
     Uses select/aselect on a single decoded stream (no split buffering). Audio is
@@ -1223,9 +1236,9 @@ def _render_base(source: str, out: str, clip_start: float, clip_dur: float, keep
     head = f"[0:v]setpts=PTS-STARTPTS,fps={FPS},select='{sel}',setpts=N/{FPS}/TB"
     expr = None
     if crop_keyframes and info['width'] / max(1, info['height']) > 9 / 16:
-        expr = _crop_expression(crop_keyframes, max(2, int(info['height'] * 9 / 16) // 2 * 2), info['width'])
+        expr = _crop_expression(crop_keyframes, speaker_crop_width(info, crop_aspect), info['width'])
     fexpr = follow_expression(follow_keyframes, info, zoom) if follow_keyframes and expr is None else None
-    video = _framing(head, info, expr, zoom, background, fexpr)
+    video = _framing(head, info, expr, zoom, background, fexpr, crop_aspect)
     if punches:
         video += (f";[fr]zoompan=z='{_zoom_expression(punches)}':d=1:x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':"
                   f"s={OUT_W}x{OUT_H}:fps={FPS},format=yuv420p[v]")
@@ -1377,7 +1390,8 @@ def render_clip(source: str, banner: str, clip: dict, words: list[dict], output:
         report(0.02)
         # The first pass is the heavier one (decode + framing + blur), ~60% of the time.
         _render_base(source, base, start, end - start, keep, crop_kf, info, zoom, opt['background'], punches,
-                     progress=lambda f: report(0.03 + 0.57 * f), follow_keyframes=follow_kf)
+                     progress=lambda f: report(0.03 + 0.57 * f), follow_keyframes=follow_kf,
+                     crop_aspect=SPEAKER_ASPECTS.get(opt.get('speaker_frame') or 'full', 9 / 16))
         base_dur = probe(base)['duration'] or base_dur
 
         hook_range, hook_words = None, []
