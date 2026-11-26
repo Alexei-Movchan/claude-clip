@@ -9,7 +9,7 @@ import hashlib, json, os, re, shutil, subprocess, tempfile, urllib.request, zipf
 from pathlib import Path
 from typing import Callable
 
-APP_VERSION = '1.15.0'
+APP_VERSION = '1.15.1'
 DEFAULT_OWNER = 'Alexei-Movchan'
 DEFAULT_REPO = 'claude-clip'
 ASSET_NAME = 'Cloudy_Clip_Studio_Source.zip'

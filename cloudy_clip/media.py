@@ -645,12 +645,18 @@ def _ollama_chat(base_url: str, model: str, prompt: str, num_ctx: int = 16384, m
     return ''.join(parts)
 
 
-def _sentence_chunks(sents: list[dict], max_tokens: int, overlap_seconds: float) -> list[list[dict]]:
-    """Split phrases so each request fits the model context (≈2.6 chars per token for Russian)."""
+def _sentence_chunks(sents: list[dict], max_tokens: int, overlap_seconds: float,
+                     max_seconds: float | None = None) -> list[list[dict]]:
+    """Split phrases so each request fits the model context (≈2.6 chars per token for Russian).
+
+    max_seconds also limits how much video one part covers: with sparse speech a part full of text
+    could span 25 minutes, and a small model then picks moments only from its first minutes.
+    """
     chunks, i = [], 0
     while i < len(sents):
         tokens, j = 0, i
-        while j < len(sents) and (j == i or tokens + (len(sents[j]['text']) + 20) / 2.6 <= max_tokens):
+        while j < len(sents) and (j == i or (tokens + (len(sents[j]['text']) + 20) / 2.6 <= max_tokens
+                                             and (max_seconds is None or sents[j]['end'] - sents[i]['start'] <= max_seconds))):
             tokens += (len(sents[j]['text']) + 20) / 2.6; j += 1
         chunks.append(sents[i:j])
         if j >= len(sents): break
@@ -711,6 +717,9 @@ def _parse_ranges(items: list, chunk: list[dict], sents: list[dict]) -> tuple[li
     return out, problems
 
 
+AI_PART_SECONDS = 420.0   # one AI request covers at most ~7 minutes of video
+
+
 def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: str = 'http://127.0.0.1:11434', model: str = 'qwen3:4b',
               target_min: int = 90, target_max: int = 150, use_local_ai: bool = True,
               notice_callback: Callable[[str], None] | None = None,
@@ -728,7 +737,7 @@ def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: s
         return fallback_clips(words, target_min, target_max, scenes=scenes)
     sents = annotate_boundaries(build_sentences(words, scenes=scenes), scenes)
     errors, chosen, log = [], [], []
-    chunks = _sentence_chunks(sents, max_tokens=4500, overlap_seconds=target_max * 0.6)
+    chunks = _sentence_chunks(sents, max_tokens=4500, overlap_seconds=target_max * 0.6, max_seconds=AI_PART_SECONDS)
 
     def ask(chunk, n, want_min, exclude):
         out_lines = []
@@ -755,7 +764,8 @@ def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: s
             'Строки «— пауза … —» и «— смена сцены —» без номеров — это паузы и смены сцен в видео. '
             'Фрагмент — законченная история или разговор целиком: начинай с начала разговора, заканчивай там, где он '
             'заканчивается (обычно перед длинной паузой или сменой сцены). НЕ обрывай фрагмент посреди диалога. '
-            'Ищи истории, юмор, эмоции, неожиданные повороты, сильные мысли, интригу. Фрагменты не пересекаются.\n' + excl +
+            'Ищи истории, юмор, эмоции, неожиданные повороты, сильные мысли, интригу. Фрагменты не пересекаются. '
+            'Бери фрагменты из начала, середины и конца списка, а не только из начала.\n' + excl +
             'Верни JSON: {"clips": [{"start_id": 0, "end_id": 0, "title": "короткое название", '
             '"hook": "дословная цепляющая фраза", "score": 1-100, "reason": "почему интересно"}]}\n'
             'Пиши компактно, без отступов: title — до 8 слов, hook — до 12 слов, reason — до 10 слов.\n\n'
@@ -800,13 +810,27 @@ def ai_select(words: list[dict], transcript: str, api_key: str = '', base_url: s
                 a, b = refine_borders(sents, fit[0], fit[1], target_min, target_max)
                 cand = {'start': sents[a]['start'], 'end': sents[b]['end']}
                 hits = [x for x in chosen if _overlap_ratio(cand, x) >= 0.3]
-                if hits:   # try the free space right after the clip(s) it runs into
+                if hits:   # try the free space right after the clip(s) it runs into, then right before
+                    moved = None
                     after = max(x['end'] for x in hits)
                     s2 = next((k for k in range(a, min(len(sents), b + 40)) if sents[k]['start'] >= after), None)
-                    fit2 = fit_to_sentences(sents, s2, max(s2, e_id), target_min, target_max) if s2 is not None else None
-                    if fit2:
-                        a, b = fit2; cand = {'start': sents[a]['start'], 'end': sents[b]['end']}
-                    if not fit2 or any(_overlap_ratio(cand, x) >= 0.3 for x in chosen):
+                    if s2 is not None:
+                        f2 = fit_to_sentences(sents, s2, max(s2, e_id), target_min, target_max)
+                        if f2: moved = refine_borders(sents, f2[0], f2[1], target_min, target_max)
+                    if moved is None or any(_overlap_ratio({'start': sents[moved[0]]['start'], 'end': sents[moved[1]]['end']}, x) >= 0.3
+                                            for x in chosen):
+                        moved = None
+                        before = min(x['start'] for x in hits)
+                        e2 = next((k for k in range(b, max(-1, a - 40), -1) if sents[k]['end'] <= before), None)
+                        if e2 is not None:
+                            s3 = e2
+                            while s3 > 0 and clip_length(sents, s3, e2) < target_min and sents[e2]['end'] - sents[s3 - 1]['start'] <= target_max * WALL_LIMIT:
+                                s3 -= 1
+                            if target_min <= clip_length(sents, s3, e2) <= target_max:
+                                moved = refine_borders(sents, s3, e2, target_min, target_max)
+                    if moved:
+                        a, b = moved; cand = {'start': sents[a]['start'], 'end': sents[b]['end']}
+                    if not moved or any(_overlap_ratio(cand, x) >= 0.3 for x in chosen):
                         overl += 1; continue
                 try: score = max(1.0, min(100.0, float(c.get('score', 50))))
                 except (TypeError, ValueError): score = 50.0
