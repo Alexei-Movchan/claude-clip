@@ -1259,7 +1259,7 @@ def _ad_positions(base_dur: float, ad_dur: float, count: int, word_times: list[t
 
 def _assemble(base: str, banner: str, banner_info: dict, out: str, base_dur: float, positions: list[float],
               ad_dur: float, speed: float, ass_path: str, td: str, hook: tuple[float, float] | None = None,
-              progress: Callable[[float], None] | None = None) -> dict:
+              progress: Callable[[float], None] | None = None, music: dict | None = None) -> dict:
     """Second (final) encode: [hook] + content pieces + frozen-frame ad breaks + captions, one concat."""
     bw, bh = max(1, banner_info['width']), max(1, banner_info['height'])
     scale = min(OUT_W / bw, (OUT_H * 0.9) / bh)
@@ -1306,9 +1306,22 @@ def _assemble(base: str, banner: str, banner_info: dict, out: str, base_dur: flo
             labels.append(f'[av{idx}][aa{idx}]')
     graph.append(f"{''.join(labels)}concat=n={len(labels)}:v=1:a=1[vc][ac]")
     graph.append(f"[vc]ass='{_ffmpeg_filter_path(ass_path)}',format=yuv420p[v]")
-    _encode([ffmpeg_path(), '-y', *args, '-filter_complex', ';'.join(graph), '-map', '[v]', '-map', '[ac]'],
+    hook_len = hook[1] if hook else 0.0
+    total = hook_len + base_dur + len(positions) * ad_dur
+    audio_out = '[ac]'
+    if music and music.get('path') and float(music.get('volume', 0)) > 0:
+        windows = [(hook_len + p + i * ad_dur, hook_len + p + (i + 1) * ad_dur) for i, p in enumerate(positions)]
+        m = add_input('-stream_loop', '-1', '-i', music['path'])
+        graph.append(f'[{m}:a]asetpts=PTS-STARTPTS,aresample={SAMPLE_RATE},aformat=sample_fmts=fltp:channel_layouts=stereo,'
+                     f'atrim=duration={total:.4f},asetpts=PTS-STARTPTS,'
+                     f"volume='{music_gain_expression(float(music['volume']), windows)}':eval=frame,"
+                     f'afade=t=in:d=0.5,afade=t=out:st={max(0.0, total - 1.5):.3f}:d=1.5[mus]')
+        # Music sits under the original sound; the limiter only catches rare peaks, it does not change the level.
+        graph.append('[ac][mus]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.97:level=0[am]')
+        audio_out = '[am]'
+    _encode([ffmpeg_path(), '-y', *args, '-filter_complex', ';'.join(graph), '-map', '[v]', '-map', audio_out],
             ['-r', str(FPS), '-c:a', 'aac', '-b:a', '256k', '-ar', str(SAMPLE_RATE), '-ac', '2', '-movflags', '+faststart', out], 18,
-            (hook[1] if hook else 0.0) + base_dur + len(positions) * ad_dur, progress)
+            total, progress)
     area = (sw * sh) / (OUT_W * OUT_H)
     return {'visible_area_ratio': area, 'scaled_width': sw, 'scaled_height': sh, 'preserved_aspect_ratio': True,
             'chroma_key_enabled': True, 'banner_audio_used': banner_info['has_audio'], 'source_audio_muted': True,
@@ -1316,6 +1329,17 @@ def _assemble(base: str, banner: str, banner_info: dict, out: str, base_dur: flo
 
 
 HOOK_MAX = 4.5
+MUSIC_FADE = 0.8  # seconds the music takes to fade out before an ad break and back in after it
+
+
+def music_gain_expression(volume: float, windows: list[tuple[float, float]], fade: float = MUSIC_FADE) -> str:
+    """volume (0..1) everywhere, smoothly down to 0 for each ad break [a, b] and back up after it.
+
+    Each break multiplies by clip(max((a-t)/fade, (t-b)/fade), 0, 1): it falls from 1 to 0 during the
+    `fade` seconds before the banner, stays 0 while the banner plays, rises back to 1 after it.
+    """
+    v = max(0.0, min(1.0, float(volume)))
+    return f'{v:.3f}' + ''.join(f'*clip(max(({a:.3f}-t)/{fade:.3f}\\,(t-{b:.3f})/{fade:.3f})\\,0\\,1)' for a, b in windows)
 
 
 def render_clip(source: str, banner: str, clip: dict, words: list[dict], output: str, speed: float = 1.0,
@@ -1386,7 +1410,7 @@ def render_clip(source: str, banner: str, clip: dict, words: list[dict], output:
             write_srt(str(Path(output).with_suffix('.srt')), final_words, total,
                       no_punct=subtitle_style(opt['subtitle_style']).get('no_punct', True))
         check = _assemble(base, banner, banner_info, output, base_dur, positions, ad_dur, speed, ass, td, hook_range,
-                          progress=lambda f: report(0.6 + 0.4 * f))
+                          progress=lambda f: report(0.6 + 0.4 * f), music=opt.get('music'))
         out_positions = [round(to_final(p) - ad_dur, 2) for p in positions]
         return {'duration': total, 'banner_count': count, 'banner_positions': out_positions,
                 'banner_duration': ad_dur, 'banner_checks': [check] * count,

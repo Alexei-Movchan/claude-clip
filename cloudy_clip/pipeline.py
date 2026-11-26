@@ -232,9 +232,13 @@ class RenderWorker(QObject):
                     except Exception:
                         pass
                 step(0.23, f"Монтаж {i}/{n}: {clip.get('title') or title}")
+                tracks = [f for f in self.settings.get('music_files') or [] if os.path.exists(f)]
+                music = ({'path': tracks[(first_no + i - 2) % len(tracks)], 'volume': float(self.settings.get('music_volume', 0.3))}
+                         if tracks else None)  # several tracks: each clip gets the next one
                 banner_data = render_clip(self.source, self.banner, clip, words, str(out), 1.0, speaker_data=speaker_data,
                                           zoom=float(self.settings.get('zoom', 1.3)),
-                                          options={**options, 'progress': lambda f: step(0.23 + 0.72 * f)})
+                                          options={**options, 'music': music, 'progress': lambda f: step(0.23 + 0.72 * f)})
+                banner_data['music'] = os.path.basename(music['path']) if music else ''
                 rendered = probe(str(out))
                 step(0.95, f'Финальная проверка {i}/{n}')
                 quality_scan = scan_render_quality(str(out), banner_data.get('ad_windows'))

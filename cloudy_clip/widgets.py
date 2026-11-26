@@ -2,7 +2,7 @@
 from __future__ import annotations
 import os, tempfile
 from pathlib import Path
-from PySide6.QtCore import Qt, QSize, QRectF, Signal, QObject, Slot, QByteArray, QPoint
+from PySide6.QtCore import QRect, Qt, QSize, QRectF, Signal, QObject, Slot, QByteArray, QPoint
 from PySide6.QtGui import QPainter, QColor, QPixmap, QIcon, QPen, QFont
 from PySide6.QtWidgets import (QWidget, QCheckBox, QPushButton, QLabel, QHBoxLayout, QVBoxLayout, QFrame,
                                QStackedWidget, QButtonGroup, QComboBox, QSizePolicy)
@@ -51,10 +51,23 @@ class Switch(QCheckBox):
     def __init__(self, text: str = '', parent=None):
         super().__init__(text, parent)
         self.setCursor(Qt.PointingHandCursor); self.setMinimumHeight(32)
+        sp = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred); sp.setHeightForWidth(True); self.setSizePolicy(sp)
 
     def sizeHint(self):
         fm = self.fontMetrics()
         return QSize(46 + 12 + fm.horizontalAdvance(self.text()), max(32, fm.height() + 8))
+
+    def minimumSizeHint(self):
+        # Long captions wrap onto several lines instead of forcing the page to scroll sideways.
+        return QSize(46 + 12 + min(160, self.fontMetrics().horizontalAdvance(self.text())), 32)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        fm = self.fontMetrics()
+        r = fm.boundingRect(QRect(0, 0, max(40, width - 54), 10000), Qt.TextWordWrap, self.text())
+        return max(32, r.height() + 8)
 
     def hitButton(self, pos: QPoint) -> bool:
         return self.rect().contains(pos)

@@ -584,7 +584,26 @@ class MainWindow(QMainWindow):
         self.sub_nopunct = Switch('Без знаков препинания (вопросительный знак остаётся)'); self.sub_nopunct.setChecked(True); sf.addRow(self.sub_nopunct)
         self.srt = Switch('Сохранять субтитры отдельным файлом .srt (для загрузки на площадку)'); self.srt.setChecked(True); sf.addRow(self.srt)
         self.save_txt = Switch('Сохранять описание ролика отдельным файлом .txt рядом с роликом'); self.save_txt.setChecked(False); sf.addRow(self.save_txt)
-        lay.addWidget(subs); lay.addStretch()
+        lay.addWidget(subs)
+        music = QGroupBox('Музыка'); mf = QFormLayout(music)
+        self.music_files: list[str] = []
+        self.music_on = Switch('Добавлять фоновую музыку в каждый ролик'); mf.addRow(self.music_on)
+        row = QHBoxLayout(); row.setSpacing(8)
+        self.music_label = QLabel('Музыка не выбрана'); self.music_label.setObjectName('muted'); self.music_label.setWordWrap(True)
+        self.music_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred); row.addWidget(self.music_label, 1)
+        b = QPushButton('Выбрать…'); b.setObjectName('soft'); b.clicked.connect(self.pick_music); row.addWidget(b)
+        b = QPushButton('Убрать'); b.setObjectName('ghost'); b.clicked.connect(self.clear_music); row.addWidget(b)
+        mf.addRow('Треки', row)
+        vrow = QHBoxLayout()
+        self.music_volume = QSlider(Qt.Horizontal); self.music_volume.setRange(0, 100); self.music_volume.setValue(30)
+        self.music_volume_label = QLabel('30%'); self.music_volume_label.setMinimumWidth(42)
+        self.music_volume.valueChanged.connect(lambda v: self.music_volume_label.setText(f'{v}%'))
+        vrow.addWidget(self.music_volume, 1); vrow.addWidget(self.music_volume_label)
+        mf.addRow('Громкость музыки', vrow)
+        n = QLabel('Музыка играет под звуком видео. Во время рекламного баннера она плавно затихает до нуля, '
+                   'потом возвращается. Короткий трек повторяется по кругу. Если треков несколько, ролики получают их по очереди.')
+        n.setWordWrap(True); n.setObjectName('muted'); mf.addRow(n)
+        lay.addWidget(music); lay.addStretch()
         self.apply_preset(self.sub_preset.currentText())
         page = QWidget(); h = QHBoxLayout(page); h.setContentsMargins(0, 0, 0, 0)
         h.addWidget(self._scroll(tab), 1)
@@ -738,7 +757,9 @@ class MainWindow(QMainWindow):
                 'scene_analysis': self.scene_analysis.isChecked(),
                 'fill_clips': self.fill_clips.currentIndex() == 0, 'save_txt': self.save_txt.isChecked(),
                 'ai_descriptions': self.ai_desc.isChecked(), 'manual_pick': self.manual_pick.isChecked(),
-                'subtitle_style': self.subtitle_style()}
+                'subtitle_style': self.subtitle_style(),
+                'music_files': list(self.music_files) if self.music_on.isChecked() else [],
+                'music_volume': self.music_volume.value() / 100}
 
     def load_settings(self):
         p = Path.home() / '.cloudy_clip_studio.json'
@@ -771,6 +792,9 @@ class MainWindow(QMainWindow):
         if 'upper' in st: self.sub_upper.setChecked(bool(st['upper']))
         if 'no_punct' in st: self.sub_nopunct.setChecked(bool(st['no_punct']))
         if ui.get('out_dir'): self.out_edit.setText(ui['out_dir'])
+        self.music_on.setChecked(bool(ui.get('music_on', False)))
+        if isinstance(ui.get('music_volume'), int): self.music_volume.setValue(ui['music_volume'])
+        self._set_music([f for f in ui.get('music_files') or [] if Path(f).exists()])
         if ui.get('banner') and Path(ui['banner']).exists():
             self.banner = ui['banner']; self.banner_edit.setText(self.banner)
         if 'preview_speaker' in ui:
@@ -790,6 +814,7 @@ class MainWindow(QMainWindow):
                 if w.isEditable(): w.currentTextChanged.connect(kick)
         for w in self.findChildren(QCheckBox): w.toggled.connect(kick)
         for w in self.findChildren(QSpinBox): w.valueChanged.connect(kick)
+        self.music_volume.valueChanged.connect(kick)
         for w in self.findChildren(QLineEdit):
             if w not in skip and not w.isReadOnly() and not isinstance(w.parent(), (QComboBox, QSpinBox)):
                 w.textChanged.connect(kick)
@@ -812,7 +837,9 @@ class MainWindow(QMainWindow):
                     'speaker_crop': self.speaker_crop.isChecked(), 'soft_follow': self.soft_follow.isChecked(),
                     'scene_analysis': self.scene_analysis.isChecked(),
                     'preview_speaker': self.design_preview.speaker.isChecked(),
-                    'out_dir': self.out_edit.text().strip(), 'banner': self.banner}}
+                    'out_dir': self.out_edit.text().strip(), 'banner': self.banner,
+                    'music_on': self.music_on.isChecked(), 'music_files': self.music_files,
+                    'music_volume': self.music_volume.value()}}
         # Write to a temp file and swap: a crash mid-write can never leave a broken settings file.
         target = Path.home() / '.cloudy_clip_studio.json'; tmp = target.with_suffix('.json.tmp')
         tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8'); os.replace(tmp, target)
@@ -961,6 +988,28 @@ class MainWindow(QMainWindow):
     def pick_banner(self):
         p, _ = QFileDialog.getOpenFileName(self, 'Выберите анимационный баннер', '', 'Видео/GIF (*.mp4 *.mov *.webm *.gif *.mkv)')
         if p: self.banner = p; self.banner_edit.setText(p); self.save_settings(quiet=True)
+
+    def _set_music(self, files: list[str]):
+        self.music_files = files
+        if not files: self.music_label.setText('Музыка не выбрана')
+        elif len(files) == 1: self.music_label.setText(Path(files[0]).name)
+        else: self.music_label.setText(f'{len(files)} трека(ов): ' + ', '.join(Path(f).name for f in files[:3]) + ('…' if len(files) > 3 else ''))
+        self.music_label.setToolTip('\n'.join(files))
+
+    def pick_music(self):
+        files, _ = QFileDialog.getOpenFileNames(self, 'Выберите музыку', str(Path(self.music_files[0]).parent) if self.music_files else '',
+                                                'Музыка (*.mp3 *.wav *.m4a *.aac *.ogg *.flac *.opus *.wma);;Все файлы (*)')
+        if not files: return
+        good, bad = [], []
+        for f in files:
+            try: (good if probe(f)['has_audio'] else bad).append(f)
+            except Exception: bad.append(f)
+        if bad: QMessageBox.warning(self, 'Музыка', 'В этих файлах не найден звук:\n' + '\n'.join(Path(b).name for b in bad))
+        if good:
+            self._set_music(good); self.music_on.setChecked(True); self.save_settings(quiet=True)
+
+    def clear_music(self):
+        self._set_music([]); self.music_on.setChecked(False); self.save_settings(quiet=True)
 
     def pick_output(self):
         p = QFileDialog.getExistingDirectory(self, 'Папка для результатов', self.out_edit.text())
@@ -1320,7 +1369,7 @@ class MainWindow(QMainWindow):
             f"Оценка: {r['score']:.0f}/100\nПочему выбран: {r['reason'] or '—'}\n"
             f"Хук в начале: {str(b.get('hook_seconds', 0)) + ' с' if b.get('hook_seconds') else 'нет'} ({r.get('hook') or '—'})\n"
             f"Приближения: {len(b.get('punch_ins', []))}\nБаннеров: {b['banner_count']} (на {b['banner_positions']} с)\n"
-            f"Кадрирование: {speaker.get('reason', 'не запускалось')}\nКодирование: {b.get('encoder', '—')}\n"
+            f"Кадрирование: {speaker.get('reason', 'не запускалось')}\nМузыка: {b.get('music') or 'нет'}\nКодирование: {b.get('encoder', '—')}\n"
             f"Проверка качества: {'выполнена' if scan.get('scan_completed') else 'не завершена'}\n"
             f"Предупреждения: {', '.join(warnings) or 'нет'}\n\nОписание:\n{desc}")
 
