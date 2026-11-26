@@ -538,6 +538,7 @@ class MainWindow(QMainWindow):
         right = QFrame(); right.setObjectName('card'); rv = QVBoxLayout(right); rv.setContentsMargins(20, 14, 20, 14); rv.setSpacing(4)
         self.manual_pick = Switch('Выбрать моменты вручную перед монтажом'); self.manual_pick.setChecked(True); rv.addWidget(self.manual_pick)
         self.ai_desc = Switch('Название, описание и хэштеги через AI'); self.ai_desc.setChecked(True); rv.addWidget(self.ai_desc)
+        self.use_banner = QCheckBox(right); self.use_banner.setChecked(True); self.use_banner.hide()  # set by the banner buttons
         self.more_btn = QPushButton('Дополнительно: модель, устройство, кодирование, папки  ›'); self.more_btn.setObjectName('link')
         self.more_btn.setCheckable(True); rv.addWidget(self.more_btn); rv.addStretch()
         left.setMinimumHeight(150); right.setMinimumHeight(150)
@@ -553,7 +554,10 @@ class MainWindow(QMainWindow):
         self.out_edit = QLineEdit(str(Path.home() / 'Videos' / 'CloudyClipStudio')); orow = QHBoxLayout(); orow.addWidget(self.out_edit, 1)
         ob = QPushButton('Выбрать'); ob.setObjectName('ghost'); ob.clicked.connect(self.pick_output); orow.addWidget(ob); of.addRow('Папка для роликов', orow)
         self.banner_edit = QLineEdit(self.banner); self.banner_edit.setReadOnly(True); br = QHBoxLayout(); br.addWidget(self.banner_edit, 1)
-        bb = QPushButton('Выбрать'); bb.setObjectName('ghost'); bb.clicked.connect(self.pick_banner); br.addWidget(bb); of.addRow('Рекламный баннер', br)
+        bb = QPushButton('Выбрать'); bb.setObjectName('ghost'); bb.clicked.connect(self.pick_banner); br.addWidget(bb)
+        bx = QPushButton('Без баннера'); bx.setObjectName('ghost'); bx.setToolTip('Делать ролики без рекламной вставки. Вернуть — кнопка «Выбрать».')
+        bx.clicked.connect(lambda: self.use_banner.setChecked(False)); br.addWidget(bx); of.addRow('Рекламный баннер', br)
+        self.use_banner.toggled.connect(self._sync_banner_field); self._sync_banner_field()
         self.more.setMinimumHeight(360); self.more.hide(); lay.addWidget(self.more)
         self.more_btn.toggled.connect(lambda on: (self.more.setVisible(on), self.more_btn.setText(
             'Дополнительно: модель, устройство, кодирование, папки  ' + ('⌄' if on else '›'))))
@@ -807,7 +811,9 @@ class MainWindow(QMainWindow):
         if isinstance(ui.get('music_volume'), int): self.music_volume.setValue(ui['music_volume'])
         self._set_music([f for f in ui.get('music_files') or [] if Path(f).exists()])
         if ui.get('banner') and Path(ui['banner']).exists():
-            self.banner = ui['banner']; self.banner_edit.setText(self.banner)
+            self.banner = ui['banner']
+        if 'use_banner' in ui: self.use_banner.setChecked(bool(ui['use_banner']))
+        self._sync_banner_field()
         if 'preview_speaker' in ui:
             for pane in (self.design_preview, self.select_preview):
                 pane.speaker.blockSignals(True); pane.speaker.setChecked(bool(ui['preview_speaker'])); pane.speaker.blockSignals(False)
@@ -849,7 +855,7 @@ class MainWindow(QMainWindow):
                     'speaker_crop': self.speaker_crop.isChecked(), 'soft_follow': self.soft_follow.isChecked(),
                     'scene_analysis': self.scene_analysis.isChecked(),
                     'preview_speaker': self.design_preview.speaker.isChecked(),
-                    'out_dir': self.out_edit.text().strip(), 'banner': self.banner,
+                    'out_dir': self.out_edit.text().strip(), 'banner': self.banner, 'use_banner': self.use_banner.isChecked(),
                     'music_on': self.music_on.isChecked(), 'music_files': self.music_files,
                     'music_volume': self.music_volume.value()}}
         # Write to a temp file and swap: a crash mid-write can never leave a broken settings file.
@@ -999,7 +1005,20 @@ class MainWindow(QMainWindow):
 
     def pick_banner(self):
         p, _ = QFileDialog.getOpenFileName(self, 'Выберите анимационный баннер', '', 'Видео/GIF (*.mp4 *.mov *.webm *.gif *.mkv)')
-        if p: self.banner = p; self.banner_edit.setText(p); self.save_settings(quiet=True)
+        if p:
+            self.banner = p; self.use_banner.setChecked(True); self._sync_banner_field(); self.save_settings(quiet=True)
+
+    def _sync_banner_field(self, *_):
+        on = self.use_banner.isChecked()
+        self.banner_edit.setText(self.banner if on else 'Без баннера — ролики без рекламной вставки')
+        if not self._loading_flag(): self.save_settings(quiet=True)
+        self.banner_edit.setEnabled(on)
+
+    def _loading_flag(self) -> bool:
+        return getattr(self, '_loading', True) or not hasattr(self, 'local_model')
+
+    def active_banner(self) -> str:
+        return self.banner if self.use_banner.isChecked() else ''
 
     def _set_music(self, files: list[str]):
         self.music_files = files
@@ -1029,13 +1048,15 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ processing flow
     def start_processing(self):
-        if not self.sources or not self.banner:
-            QMessageBox.warning(self, 'Не хватает файлов', 'Добавьте хотя бы одно видео и выберите баннер.'); return
+        if not self.sources:
+            QMessageBox.warning(self, 'Не хватает файлов', 'Добавьте хотя бы одно видео.'); return
+        if self.use_banner.isChecked() and not (self.banner and Path(self.banner).exists()):
+            QMessageBox.warning(self, 'Нет баннера', 'Выберите файл баннера в «Дополнительно» или нажмите там «Без баннера».'); return
         if not ffmpeg_available():
             QMessageBox.critical(self, 'Не найден FFmpeg', 'Установите FFmpeg и добавьте ffmpeg.exe и ffprobe.exe в PATH. Инструкция есть в README.'); return
         bad = []
         try:
-            if probe(self.banner)['duration'] <= 0: raise RuntimeError('Не удалось прочитать длительность баннера.')
+            if self.active_banner() and probe(self.banner)['duration'] <= 0: raise RuntimeError('Не удалось прочитать длительность баннера.')
             for s in self.sources:
                 if probe(s)['duration'] < 90: bad.append(Path(s).name)
         except Exception as e:
@@ -1081,7 +1102,7 @@ class MainWindow(QMainWindow):
                                  else Path(self.current_source).name)
         self._eta = -1.0
         self.progress.setValue(0)
-        self._run(AnalyzeWorker(self.current_source, self.banner, self.current_out, self.run_settings), self.on_analyzed, self.on_failed)
+        self._run(AnalyzeWorker(self.current_source, self.active_banner(), self.current_out, self.run_settings), self.on_analyzed, self.on_failed)
 
     def on_analyzed(self, payload: dict):
         self.analysis = payload
@@ -1099,7 +1120,7 @@ class MainWindow(QMainWindow):
         if not clips: self._next_video(); return
         clips = sorted(clips, key=lambda c: float(c['start']))  # Clip_01, Clip_02… follow the episode in order
         p = self.analysis
-        self._run(RenderWorker(p['source'], self.banner, p['out_dir'], self.run_settings, clips, p['words'], p.get('scenes')),
+        self._run(RenderWorker(p['source'], self.active_banner(), p['out_dir'], self.run_settings, clips, p['words'], p.get('scenes')),
                   self.on_rendered, self.on_failed)
 
     def on_rendered(self, results: list, msg: str):
@@ -1380,7 +1401,8 @@ class MainWindow(QMainWindow):
             f"Файл: {r['file']}\nИсходный отрезок: {_fmt(r['start'])}–{_fmt(r['end'])}\nДлительность: {b['duration']:.1f} с\n"
             f"Оценка: {r['score']:.0f}/100\nПочему выбран: {r['reason'] or '—'}\n"
             f"Хук в начале: {str(b.get('hook_seconds', 0)) + ' с' if b.get('hook_seconds') else 'нет'} ({r.get('hook') or '—'})\n"
-            f"Приближения: {len(b.get('punch_ins', []))}\nБаннеров: {b['banner_count']} (на {b['banner_positions']} с)\n"
+            f"Приближения: {len(b.get('punch_ins', []))}\n"
+            f"Баннеров: {(str(b['banner_count']) + ' (на ' + str(b['banner_positions']) + ' с)') if b['banner_count'] else 'без баннера'}\n"
             f"Кадрирование: {speaker.get('reason', 'не запускалось')}\nМузыка: {b.get('music') or 'нет'}\nКодирование: {b.get('encoder', '—')}\n"
             f"Проверка качества: {'выполнена' if scan.get('scan_completed') else 'не завершена'}\n"
             f"Предупреждения: {', '.join(warnings) or 'нет'}\n\nОписание:\n{desc}")

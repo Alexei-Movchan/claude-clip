@@ -1298,6 +1298,7 @@ def _assemble(base: str, banner: str, banner_info: dict, out: str, base_dur: flo
               ad_dur: float, speed: float, ass_path: str, td: str, hook: tuple[float, float] | None = None,
               progress: Callable[[float], None] | None = None, music: dict | None = None) -> dict:
     """Second (final) encode: [hook] + content pieces + frozen-frame ad breaks + captions, one concat."""
+    banner_info = banner_info or {'width': OUT_W, 'height': OUT_H, 'has_audio': False}
     bw, bh = max(1, banner_info['width']), max(1, banner_info['height'])
     scale = min(OUT_W / bw, (OUT_H * 0.9) / bh)
     sw, sh = max(2, int(bw * scale) // 2 * 2), max(2, int(bh * scale) // 2 * 2)
@@ -1387,7 +1388,7 @@ def render_clip(source: str, banner: str, clip: dict, words: list[dict], output:
     report = opt['progress'] or (lambda f: None)
     start, end = float(clip['start']), float(clip['end'])
     info = probe(source)
-    banner_info = probe(banner)
+    banner_info = probe(banner) if banner else None   # no banner: the clip is made without ad breaks
     speed = max(1.0, min(1.3, float(speed)))
     with tempfile.TemporaryDirectory(prefix='cloudy_') as td:
         keep = plan_keep_ranges(words, start, end, scenes=opt.get('scenes'))
@@ -1430,9 +1431,12 @@ def render_clip(source: str, banner: str, clip: dict, words: list[dict], output:
                     hook_words = [(w, a - hs, b - hs) for w, (a, b) in zip(clip_words[i0:i1 + 1], word_times[i0:i1 + 1])]
         hook_len = hook_range[1] if hook_range else 0.0
 
-        ad_dur = _snap(banner_info['duration'] / speed)
-        count = 1 if hook_len + base_dur + ad_dur < 120 else 2
-        positions = _ad_positions(base_dur, ad_dur, count, word_times, hook_len)
+        if banner_info:
+            ad_dur = _snap(banner_info['duration'] / speed)
+            count = 1 if hook_len + base_dur + ad_dur < 120 else 2
+            positions = _ad_positions(base_dur, ad_dur, count, word_times, hook_len)
+        else:
+            ad_dur, count, positions = 0.0, 0, []
 
         def to_final(t: float) -> float:
             return hook_len + t + ad_dur * sum(1 for p in positions if p <= t + 1e-6)
@@ -1450,9 +1454,10 @@ def render_clip(source: str, banner: str, clip: dict, words: list[dict], output:
         check = _assemble(base, banner, banner_info, output, base_dur, positions, ad_dur, speed, ass, td, hook_range,
                           progress=lambda f: report(0.6 + 0.4 * f), music=opt.get('music'))
         out_positions = [round(to_final(p) - ad_dur, 2) for p in positions]
-        return {'duration': total, 'banner_count': count, 'banner_positions': out_positions,
+        return {'duration': total, 'banner_enabled': bool(banner_info), 'banner_count': count, 'banner_positions': out_positions,
                 'banner_duration': ad_dur, 'banner_checks': [check] * count,
-                'banner_area_ratio': check['visible_area_ratio'], 'banner_area_passed': check['visible_area_ratio'] >= 0.25,
+                'banner_area_ratio': check['visible_area_ratio'] if banner_info else 0.0,
+                'banner_area_passed': check['visible_area_ratio'] >= 0.25 or not banner_info,
                 'aspect_ratio_preserved': True, 'banner_audio_replaces_source_audio': True,
                 'chroma_key_removed': True, 'removed_pause_seconds': round((end - start) - sum(b - a for a, b in keep), 2),
                 'pause_trim_enabled': True, 'letterbox_enabled': not bool(crop_kf),

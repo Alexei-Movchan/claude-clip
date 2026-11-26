@@ -96,9 +96,9 @@ class AnalyzeWorker(QObject):
         try:
             Path(self.out_dir).mkdir(parents=True, exist_ok=True)
             self.progress.emit(3, 'Проверка исходных файлов')
-            src_info = probe(self.source); banner_info = probe(self.banner)
+            src_info = probe(self.source); banner_info = probe(self.banner) if self.banner else {'duration': 0.0}
             if not src_info['has_audio']: raise RuntimeError('В исходном видео не найдена аудиодорожка.')
-            if banner_info['duration'] <= 0: raise RuntimeError('Не удалось определить длительность баннера.')
+            if self.banner and banner_info['duration'] <= 0: raise RuntimeError('Не удалось определить длительность баннера.')
             model = self.settings.get('whisper_model', 'small')
             key, words, transcript = self._cached_transcript(model)
             if words:
@@ -247,19 +247,19 @@ class RenderWorker(QObject):
                     'duration_90_150': 89.9 <= rendered['duration'] <= 150.1,
                     'vertical_9_16': rendered['width'] == 1080 and rendered['height'] == 1920,
                     'audio_present': rendered['has_audio'],
-                    'banner_count_expected': banner_data['banner_count'] == (1 if rendered['duration'] < 120 else 2),
+                    'banner_count_expected': banner_data['banner_count'] == ((1 if rendered['duration'] < 120 else 2) if self.banner else 0),
                     'banner_area_25_percent': banner_data.get('banner_area_passed', False),
                     'banner_aspect_ratio_preserved': banner_data.get('aspect_ratio_preserved', False),
                     'pause_trim_enabled': banner_data.get('pause_trim_enabled', False),
                     'framing_mode_valid': bool(banner_data.get('letterbox_enabled') or banner_data.get('speaker_tracking')),
-                    'banner_audio_replaces_source': banner_data.get('banner_audio_replaces_source_audio', False),
-                    'chroma_key_removed': banner_data.get('chroma_key_removed', False),
+                    'banner_audio_replaces_source': banner_data.get('banner_audio_replaces_source_audio', False) or not self.banner,
+                    'chroma_key_removed': banner_data.get('chroma_key_removed', False) or not self.banner,
                 }
                 if meta:
                     parts = [meta['title'], meta['description'], ' '.join(meta['hashtags'])]
                 else:
                     parts = [clip.get('title') or '', clip.get('hook') or 'Интересный момент из видео.']
-                description = '\n\n'.join(p for p in parts if p) + '\n\n' + AD_LINE
+                description = '\n\n'.join(p for p in parts if p) + ('\n\n' + AD_LINE if self.banner else '')
                 desc = out.with_suffix('.txt')
                 if self.settings.get('save_txt', False): desc.write_text(description, encoding='utf-8')
                 srt = out.with_suffix('.srt')
