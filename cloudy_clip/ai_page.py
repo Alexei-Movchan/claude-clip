@@ -225,8 +225,9 @@ class AiPage(QWidget):
     def _start(self, worker, on_done, on_fail, progress=None):
         self._threads = [(t, w) for t, w in self._threads if t.isRunning()]
         th = QThread(); worker.moveToThread(th); th.started.connect(worker.run)
-        if progress: worker.progress.connect(progress)
-        worker.done.connect(on_done); worker.failed.connect(on_fail)
+        q = Qt.QueuedConnection   # results touch widgets: always deliver them in the window thread
+        if progress: worker.progress.connect(progress, q)
+        worker.done.connect(on_done, q); worker.failed.connect(on_fail, q)
         worker.done.connect(th.quit); worker.failed.connect(th.quit)
         self._threads.append((th, worker)); th.start()
 
@@ -239,14 +240,19 @@ class AiPage(QWidget):
         self._install_worker = InstallWorker(key)
         for _t, b in self.rows.values(): b.setEnabled(False)
         self.bar.setValue(0); self.bar.show(); self.bar_text.setText('Подключение…'); self.bar_text.show(); self.cancel_install.show()
-        self._start(self._install_worker, self._installed, self._install_failed,
-                    lambda f, t: (self.bar.setValue(int(f * 1000)), self.bar_text.setText(t)))
+        self._start(self._install_worker, self._installed, self._install_failed, self._install_progress)
+
+    @Slot(float, str)
+    def _install_progress(self, f: float, text: str):
+        # a bound slot of this widget: Qt delivers it in the window thread (a lambda would run in the download thread)
+        self.bar.setValue(int(f * 1000)); self.bar_text.setText(text)
 
     def _install_end(self):
         self._install_worker = None
         for _t, b in self.rows.values(): b.setEnabled(True)
         self.bar.hide(); self.bar_text.hide(); self.cancel_install.hide()
 
+    @Slot(str)
     def _installed(self, key: str):
         self._install_end(); self.refresh()
         if key == 'esrgan':
@@ -258,6 +264,7 @@ class AiPage(QWidget):
         elif key == 'rife':
             self.interp.setChecked(True)
 
+    @Slot(str)
     def _install_failed(self, err: str):
         self._install_end(); self.refresh()
         QMessageBox.warning(self, 'Установка AI', err)
@@ -274,6 +281,7 @@ class AiPage(QWidget):
         opts = self.options(); opts['on'] = True
         self._start(CompareWorker(src, t, opts, self._tmp), self._compared, self._compare_failed)
 
+    @Slot(dict)
     def _compared(self, r: dict):
         self.cmp_btn.setEnabled(True); self.cmp_btn.setText('Проверить на кадре из видео')
         self._cmp = r; self.view_seg.setEnabled(True); self.view.setCurrentIndex(1); self._show_cmp()
@@ -285,6 +293,7 @@ class AiPage(QWidget):
                               f'Показан фрагмент из центра кадра в натуральную величину.\n'
                               f'Скорость: {per:.2f} с на кадр — ролик 2 минуты займёт примерно {est:.0f} мин AI-обработки.{notes}')
 
+    @Slot(str)
     def _compare_failed(self, err: str):
         self.cmp_btn.setEnabled(E.installed('esrgan')); self.cmp_btn.setText('Проверить на кадре из видео')
         self.cmp_info.setText('Не получилось: ' + err)
