@@ -17,7 +17,7 @@ if not exist "assets\cloudy_banner.mp4" (
     exit /b 1
 )
 
-".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --windowed --onedir --name CloudyClipStudio --collect-all PySide6 --collect-all faster_whisper --collect-all ctranslate2 --collect-all cv2 --collect-all numpy --add-data "assets\cloudy_banner.mp4;assets" --add-data "assets\models;assets\models" main.py
+".venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean --windowed --onedir --name CloudyClipStudio --collect-all PySide6 --collect-all faster_whisper --collect-all ctranslate2 --collect-all cv2 --collect-all numpy --add-data "assets\cloudy_banner.mp4;assets" --add-data "assets\models;assets\models" --add-data "assets\ai_models;assets\ai_models" main.py
 if errorlevel 1 goto :failed
 
 echo.

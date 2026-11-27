@@ -2,7 +2,7 @@ from __future__ import annotations
 import json, os, time, traceback
 from pathlib import Path
 from PySide6.QtCore import QObject, Signal, Slot
-from .media import (probe, transcribe, ai_select, ai_metadata, render_clip, safe_name, scan_render_quality,
+from .media import (Cancelled, probe, transcribe, ai_select, ai_metadata, render_clip, safe_name, scan_render_quality,
                     set_encoder, analyze_scenes, HOOK_MAX)
 from .speaker import analyze_active_speaker, soft_follow_keyframes
 
@@ -160,6 +160,19 @@ class AnalyzeWorker(QObject):
             self.failed.emit(f'{e}\n\nПодробности:\n{traceback.format_exc()}')
 
 
+def ai_options(settings: dict) -> dict:
+    """AI Enhance settings for render_clip, or nothing when it is off or not installed."""
+    from .enhance import installed
+    ai = settings.get('ai_enhance') or {}
+    out = {}
+    if ai.get('on') and installed('esrgan'):
+        out['enhance'] = {k: ai.get(k) for k in ('mode', 'resolution', 'denoise', 'sharpen', 'device')}
+    if ai.get('on') and ai.get('interpolate') and installed('rife'):
+        out['interpolate'] = True
+        out.setdefault('enhance_device', ai.get('device'))
+    return out
+
+
 class RenderWorker(QObject):
     """Stage 2: metadata, speaker tracking, montage and checks for the chosen clips."""
     progress = Signal(int, str)
@@ -186,6 +199,8 @@ class RenderWorker(QObject):
                        'punch_ins': self.settings.get('punch_ins', True), 'srt': self.settings.get('srt', True),
                        'subtitle_style': self.settings.get('subtitle_style'), 'scenes': self.scenes,
                        'speaker_frame': self.settings.get('speaker_frame', 'full')}
+            options.update(ai_options(self.settings))
+            options['cancel'] = lambda: self._cancel
             results = []
             n = len(clips)
             first_no = next_clip_number(self.out_dir)
@@ -236,9 +251,16 @@ class RenderWorker(QObject):
                 tracks = [f for f in self.settings.get('music_files') or [] if os.path.exists(f)]
                 music = ({'path': tracks[(first_no + i - 2) % len(tracks)], 'volume': float(self.settings.get('music_volume', 0.3))}
                          if tracks else None)  # several tracks: each clip gets the next one
-                banner_data = render_clip(self.source, self.banner, clip, words, str(out), 1.0, speaker_data=speaker_data,
-                                          zoom=float(self.settings.get('zoom', 1.3)),
-                                          options={**options, 'music': music, 'progress': lambda f: step(0.23 + 0.72 * f)})
+                clip_no = f'{i}/{n}'
+                try:
+                    banner_data = render_clip(self.source, self.banner, clip, words, str(out), 1.0, speaker_data=speaker_data,
+                                              zoom=float(self.settings.get('zoom', 1.3)),
+                                              options={**options, 'music': music, 'progress': lambda f: step(0.23 + 0.72 * f),
+                                                       'stage': lambda t, c=clip_no: stage.update(text=f'{t} {c}')})
+                except Cancelled:
+                    try: out.unlink()
+                    except OSError: pass
+                    break
                 banner_data['music'] = os.path.basename(music['path']) if music else ''
                 rendered = probe(str(out))
                 step(0.95, f'Финальная проверка {i}/{n}')
@@ -271,7 +293,12 @@ class RenderWorker(QObject):
                           'quality_passed': all(checks.values()) and quality_scan.get('scan_completed', False),
                           'quality_warnings': (['При сохранении пропорций этот баннер физически занимает менее 25% площади кадра; '
                                                 'требуется согласование рекламодателя или другой исходный макет.']
-                                               if not banner_data.get('banner_area_passed', False) else []) + quality_scan.get('warnings', [])}
+                                               if not banner_data.get('banner_area_passed', False) else []) + quality_scan.get('warnings', [])
+                                              + ([f"AI-улучшение не сработало, ролик сделан без него: {banner_data['enhance_error']}"]
+                                                 if banner_data.get('enhance_error') else [])
+                                              + ([f"Плавность 60 кадров/с не сработала: {banner_data['interpolate_error']}"]
+                                                 if banner_data.get('interpolate_error') else [])}
+
                 results.append(report)
                 step(1.0, f'Готово {i}/{n}')
             manifest = data_dir_for(self.out_dir) / 'clips_manifest.json'

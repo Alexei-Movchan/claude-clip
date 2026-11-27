@@ -151,6 +151,17 @@ class PreviewWorker(QObject):
             self.failed.emit(str(e)[:300], r['id'])
 
 
+def _ai_line(b: dict) -> str:
+    e = b.get('enhance')
+    if not e: return 'не сработало — ' + b['enhance_error'] if b.get('enhance_error') else 'выключено'
+    (sw, sh), (ow, oh) = e['src_size'], e['out_size']
+    line = f"{e['model']}, {sw}×{sh} → {ow}×{oh}, {e['frames_ai']} кадров за {e['seconds'] / 60:.1f} мин ({e['device']})"
+    if e.get('notes'): line += '; ' + '; '.join(e['notes'])
+    if b.get('interpolate'): line += f"; плавность {b['interpolate']['fps']:.0f} к/с"
+    elif b.get('interpolate_error'): line += '; плавность не сработала: ' + b['interpolate_error']
+    return line
+
+
 def _fmt_precise(t: float) -> str:
     t = max(0.0, t); return f'{int(t // 60)}:{t % 60:04.1f}'
 
@@ -434,12 +445,12 @@ class MainWindow(QMainWindow):
         self.auto_update = True; self.skip_version = ''; self.shortcut_offered = False; self._update_manual = False
         self.resize(1320, 860)
         root = QWidget(); self.setCentralWidget(root); outer = QHBoxLayout(root); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(0)
-        self.tabs = NavStack([('Проект', 'plus'), ('Оформление', 'palette'), ('Моменты', 'grid'), ('Результаты', 'phone'), ('Настройки', 'gear')])
+        self.tabs = NavStack([('Проект', 'plus'), ('Оформление', 'palette'), ('Моменты', 'grid'), ('Результаты', 'phone'), ('AI-улучшение', 'sparkle'), ('Настройки', 'gear')])
         outer.addWidget(self.tabs.sidebar)
         right = QWidget(); rv = QVBoxLayout(right); rv.setContentsMargins(0, 0, 0, 0); rv.setSpacing(0)
         rv.addWidget(self.tabs, 1); outer.addWidget(right, 1)
         self._thumb_threads: list = []
-        self._build_project_tab(); self._build_design_tab(); self._build_select_tab(); self._build_results_tab(); self._build_settings_tab()
+        self._build_project_tab(); self._build_design_tab(); self._build_select_tab(); self._build_results_tab(); self._build_ai_tab(); self._build_settings_tab()
         rv.addWidget(self._build_bottom_bar())
         self._refresh_sidebar_status()
         self._loading = True
@@ -694,6 +705,12 @@ class MainWindow(QMainWindow):
         lay.addWidget(split, 1)
         self.tabs.addTab(tab, 'Результаты')
 
+    def _build_ai_tab(self):
+        from .ai_page import AiPage
+        tab, lay = self._page('AI-улучшение', 'Real-ESRGAN делает картинку чётче и чище. Бесплатно, работает на вашей видеокарте.')
+        self.ai_page = AiPage(self); lay.addWidget(self.ai_page)
+        self.tabs.addTab(self._scroll(tab), 'AI-улучшение')
+
     def _build_settings_tab(self):
         tab, lay = self._page('Настройки', 'Все настройки сохраняются автоматически.')
         box = QGroupBox('Бесплатный локальный AI — без платных API'); form = QFormLayout(box)
@@ -773,7 +790,8 @@ class MainWindow(QMainWindow):
                 'ai_descriptions': self.ai_desc.isChecked(), 'manual_pick': self.manual_pick.isChecked(),
                 'subtitle_style': self.subtitle_style(),
                 'music_files': list(self.music_files) if self.music_on.isChecked() else [],
-                'music_volume': self.music_volume.value() / 100}
+                'music_volume': self.music_volume.value() / 100,
+                'ai_enhance': self.ai_page.options()}
 
     def load_settings(self):
         p = Path.home() / '.cloudy_clip_studio.json'
@@ -810,6 +828,7 @@ class MainWindow(QMainWindow):
         self.music_on.setChecked(bool(ui.get('music_on', False)))
         if isinstance(ui.get('music_volume'), int): self.music_volume.setValue(ui['music_volume'])
         self._set_music([f for f in ui.get('music_files') or [] if Path(f).exists()])
+        self.ai_page.load(ui.get('ai') or {})
         if ui.get('banner') and Path(ui['banner']).exists():
             self.banner = ui['banner']
         if 'use_banner' in ui: self.use_banner.setChecked(bool(ui['use_banner']))
@@ -857,7 +876,7 @@ class MainWindow(QMainWindow):
                     'preview_speaker': self.design_preview.speaker.isChecked(),
                     'out_dir': self.out_edit.text().strip(), 'banner': self.banner, 'use_banner': self.use_banner.isChecked(),
                     'music_on': self.music_on.isChecked(), 'music_files': self.music_files,
-                    'music_volume': self.music_volume.value()}}
+                    'music_volume': self.music_volume.value(), 'ai': self.ai_page.options()}}
         # Write to a temp file and swap: a crash mid-write can never leave a broken settings file.
         target = Path.home() / '.cloudy_clip_studio.json'; tmp = target.with_suffix('.json.tmp')
         tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8'); os.replace(tmp, target)
@@ -1403,7 +1422,8 @@ class MainWindow(QMainWindow):
             f"Хук в начале: {str(b.get('hook_seconds', 0)) + ' с' if b.get('hook_seconds') else 'нет'} ({r.get('hook') or '—'})\n"
             f"Приближения: {len(b.get('punch_ins', []))}\n"
             f"Баннеров: {(str(b['banner_count']) + ' (на ' + str(b['banner_positions']) + ' с)') if b['banner_count'] else 'без баннера'}\n"
-            f"Кадрирование: {speaker.get('reason', 'не запускалось')}\nМузыка: {b.get('music') or 'нет'}\nКодирование: {b.get('encoder', '—')}\n"
+            f"Кадрирование: {speaker.get('reason', 'не запускалось')}\nМузыка: {b.get('music') or 'нет'}\n"
+            f"AI-улучшение: {_ai_line(b)}\nКодирование: {b.get('encoder', '—')}\n"
             f"Проверка качества: {'выполнена' if scan.get('scan_completed') else 'не завершена'}\n"
             f"Предупреждения: {', '.join(warnings) or 'нет'}\n\nОписание:\n{desc}")
 

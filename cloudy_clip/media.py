@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, os, re, subprocess, tempfile, urllib.request, urllib.error
+import json, os, re, shutil, subprocess, tempfile, urllib.request, urllib.error
 from pathlib import Path
 from typing import Any, Callable
 
@@ -1382,10 +1382,15 @@ def music_gain_expression(volume: float, windows: list[tuple[float, float]], fad
 
 def render_clip(source: str, banner: str, clip: dict, words: list[dict], output: str, speed: float = 1.0,
                 speaker_data=None, zoom: float = 1.0, options: dict | None = None):
-    """options: background ('blur'|'black'), hook (bool), punch_ins (bool), subtitle_style (dict), srt (bool)."""
+    """options: background ('blur'|'black'), hook (bool), punch_ins (bool), subtitle_style (dict), srt (bool),
+    enhance (AI settings dict or None), interpolate (bool, RIFE 60 fps), cancel (callable), stage (callable(text))."""
     opt = {'background': 'blur', 'hook': True, 'punch_ins': True, 'subtitle_style': None, 'srt': True,
            'progress': None, **(options or {})}
-    report = opt['progress'] or (lambda f: None)
+    outer = opt['progress'] or (lambda f: None)
+    stage = opt.get('stage') or (lambda text: None)
+    w_ai = 0.6 if opt.get('enhance') else 0.0          # share of this clip's progress bar per phase
+    w_rife = 0.2 if opt.get('interpolate') else 0.0
+    report = lambda f: outer(w_ai + (1 - w_ai - w_rife) * f)
     start, end = float(clip['start']), float(clip['end'])
     info = probe(source)
     banner_info = probe(banner) if banner else None   # no banner: the clip is made without ad breaks
@@ -1396,13 +1401,30 @@ def render_clip(source: str, banner: str, clip: dict, words: list[dict], output:
         clip_words = [w for w in words if float(w['end']) > start and float(w['start']) < end]
         word_times = [(mapper(float(w['start']) - start), mapper(float(w['end']) - start)) for w in clip_words]
 
+        # AI Enhance: improve only this piece of the source, before framing/subtitles/banner are added.
+        render_src, render_start, render_info, enh_info, enh_error = source, start, info, None, ''
+        if opt.get('enhance'):
+            from .enhance import enhance_segment
+            stage('AI-улучшение')
+            try:
+                enh_path = os.path.join(td, 'enhanced.mkv')
+                enh_info = enhance_segment(source, start, end - start, enh_path, opt['enhance'], keep=keep,
+                                           progress=lambda f: outer(w_ai * f), cancel=opt.get('cancel'))
+                render_src, render_start, render_info = enh_path, 0.0, probe(enh_path)
+            except Cancelled:
+                raise
+            except Exception as exc:   # AI problem: the clip is still made, just without the improvement
+                enh_error = str(exc).strip().split('\n')[0][:300]
+            stage('Монтаж')
+        fx = render_info['width'] / max(1, info['width'])   # speaker coordinates follow the bigger picture
+
         sd = speaker_data or {}
         crop_kf = sd.get('keyframes') if sd.get('mode') != 'follow' else None
         follow_kf = sd.get('keyframes') if sd.get('mode') == 'follow' else None
         if crop_kf:
-            crop_kf = [(mapper(float(t)), x) for t, x in crop_kf]
+            crop_kf = [(mapper(float(t)), x * fx) for t, x in crop_kf]
         if follow_kf:
-            follow_kf = [(mapper(float(t)), x) for t, x in follow_kf]
+            follow_kf = [(mapper(float(t)), x * fx) for t, x in follow_kf]
 
         punches: list[float] = []
         if opt['punch_ins'] and clip_words:
@@ -1414,7 +1436,7 @@ def render_clip(source: str, banner: str, clip: dict, words: list[dict], output:
         base = os.path.join(td, 'base.mp4')
         report(0.02)
         # The first pass is the heavier one (decode + framing + blur), ~60% of the time.
-        _render_base(source, base, start, end - start, keep, crop_kf, info, zoom, opt['background'], punches,
+        _render_base(render_src, base, render_start, end - start, keep, crop_kf, render_info, zoom, opt['background'], punches,
                      progress=lambda f: report(0.03 + 0.57 * f), follow_keyframes=follow_kf,
                      crop_aspect=SPEAKER_ASPECTS.get(opt.get('speaker_frame') or 'full', 9 / 16))
         base_dur = probe(base)['duration'] or base_dur
@@ -1454,7 +1476,21 @@ def render_clip(source: str, banner: str, clip: dict, words: list[dict], output:
         check = _assemble(base, banner, banner_info, output, base_dur, positions, ad_dur, speed, ass, td, hook_range,
                           progress=lambda f: report(0.6 + 0.4 * f), music=opt.get('music'))
         out_positions = [round(to_final(p) - ad_dur, 2) for p in positions]
-        return {'duration': total, 'banner_enabled': bool(banner_info), 'banner_count': count, 'banner_positions': out_positions,
+        rife_info, rife_error = None, ''
+        if opt.get('interpolate'):
+            from .enhance import interpolate_video
+            stage('Плавность 60 кадров/с')
+            try:
+                smooth = os.path.join(td, 'smooth.mp4')
+                rife_info = interpolate_video(output, smooth, opt.get('enhance') or {'device': opt.get('enhance_device')},
+                                              progress=lambda f: outer(1 - w_rife + w_rife * f), cancel=opt.get('cancel'))
+                shutil.move(smooth, output)
+            except Cancelled:
+                raise
+            except Exception as exc:
+                rife_error = str(exc).strip().split('\n')[0][:300]
+        return {'duration': total, 'banner_enabled': bool(banner_info),
+                'enhance': enh_info, 'enhance_error': enh_error, 'interpolate': rife_info, 'interpolate_error': rife_error, 'banner_count': count, 'banner_positions': out_positions,
                 'banner_duration': ad_dur, 'banner_checks': [check] * count,
                 'banner_area_ratio': check['visible_area_ratio'] if banner_info else 0.0,
                 'banner_area_passed': check['visible_area_ratio'] >= 0.25 or not banner_info,

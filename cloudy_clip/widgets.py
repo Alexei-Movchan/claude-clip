@@ -27,6 +27,7 @@ ICONS = {
     'chevron': '<path d="M9 6l6 6-6 6"/>',
     'play': '<path d="M7 4l13 8-13 8z"/>',
     'copy': '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
+    'sparkle': '<path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/>',
 }
 
 
